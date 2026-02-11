@@ -74,8 +74,8 @@ const HELP = `CHAGEE CLI (simple mode)
   item <spuId>
 
   add <skuId> [qty=1] [spuId=...] [name=...] [price=...] [specList=<json>] [attributeList=<json>]
-  qty <lineId> <n>
-  rm <lineId>
+  qty <item> <n>
+  rm <item>
   clear
   cart
 
@@ -267,11 +267,11 @@ export class App {
           await this.cmdCart(["add", ...rest]);
           return false;
         case "qty": {
-          const lineId = rest[0];
+          const itemRef = rest[0];
           const qtyToken = rest[1];
           const qtyArg =
             qtyToken && qtyToken.includes("=") ? qtyToken : qtyToken ? `qty=${qtyToken}` : "";
-          await this.cmdCart(["set", ...(lineId ? [lineId] : []), ...(qtyArg ? [qtyArg] : [])]);
+          await this.cmdCart(["set", ...(itemRef ? [itemRef] : []), ...(qtyArg ? [qtyArg] : [])]);
           return false;
         }
         case "rm":
@@ -1314,7 +1314,7 @@ export class App {
   private async cmdCart(rest: string[]): Promise<void> {
     const sub = rest[0];
     if (!sub) {
-      console.log("Usage: add <skuId> | qty <lineId> <n> | rm <lineId> | clear | cart");
+      console.log("Usage: add <skuId> | qty <item> <n> | rm <item> | clear | cart");
       return;
     }
 
@@ -1343,44 +1343,55 @@ export class App {
       this.state.cart.push(line);
       nextCartVersion(this.state);
       await this.persist();
-      console.log(`Added line ${line.lineId}`);
+      console.log(`Added item ${this.state.cart.length}`);
       return;
     }
 
     if (sub === "set") {
-      const lineId = rest[1];
+      const itemRef = rest[1];
       const parsed = parseKeyValueTokens(rest.slice(2));
       const qty = Math.max(0, Math.floor(parseNum(parsed.opts.qty, -1)));
-      if (!lineId || qty < 0) {
-        console.log("Usage: qty <lineId> <n>");
+      if (!itemRef || qty < 0) {
+        console.log("Usage: qty <item> <n>");
         return;
       }
-      const line = this.state.cart.find((l) => l.lineId === lineId);
+      const resolved = this.resolveCartItemRef(itemRef);
+      if (!resolved) {
+        console.log(`item not found: ${itemRef}`);
+        return;
+      }
+      const line = this.state.cart.find((l) => l.lineId === resolved.lineId);
       if (!line) {
-        console.log(`lineId not found: ${lineId}`);
+        console.log(`item not found: ${itemRef}`);
         return;
       }
       if (qty === 0) {
-        this.state.cart = this.state.cart.filter((l) => l.lineId !== lineId);
+        this.state.cart = this.state.cart.filter((l) => l.lineId !== resolved.lineId);
+        console.log(`Removed item ${resolved.itemNo}`);
       } else {
         line.qty = qty;
+        console.log(`Updated item ${resolved.itemNo} qty=${qty}`);
       }
       nextCartVersion(this.state);
       await this.persist();
-      console.log(`Updated line ${lineId}`);
       return;
     }
 
     if (sub === "rm") {
-      const lineId = rest[1];
-      if (!lineId) {
-        console.log("Usage: rm <lineId>");
+      const itemRef = rest[1];
+      if (!itemRef) {
+        console.log("Usage: rm <item>");
         return;
       }
-      this.state.cart = this.state.cart.filter((l) => l.lineId !== lineId);
+      const resolved = this.resolveCartItemRef(itemRef);
+      if (!resolved) {
+        console.log(`item not found: ${itemRef}`);
+        return;
+      }
+      this.state.cart = this.state.cart.filter((l) => l.lineId !== resolved.lineId);
       nextCartVersion(this.state);
       await this.persist();
-      console.log(`Removed line ${lineId}`);
+      console.log(`Removed item ${resolved.itemNo}`);
       return;
     }
 
@@ -1397,15 +1408,14 @@ export class App {
         console.log("Cart is empty");
         return;
       }
-      const rows = this.state.cart.map((l) => [
-        l.lineId,
-        l.spuId ?? "-",
+      const rows = this.state.cart.map((l, idx) => [
+        String(idx + 1),
         l.skuId,
         l.name ?? "-",
         String(l.qty),
         l.price !== undefined ? String(l.price) : "-"
       ]);
-      printTable(["lineId", "spuId", "skuId", "name", "qty", "price"], rows);
+      printTable(["item", "skuId", "name", "qty", "price"], rows);
       return;
     }
 
@@ -1439,6 +1449,28 @@ export class App {
     }
 
     console.log("Usage: add|qty|rm|clear|cart");
+  }
+
+  private resolveCartItemRef(itemRef: string): { lineId: string; itemNo: number } | undefined {
+    const asNumber = Number.parseInt(itemRef, 10);
+    if (/^\d+$/.test(itemRef) && Number.isFinite(asNumber)) {
+      const itemNo = Math.max(1, asNumber);
+      const line = this.state.cart[itemNo - 1];
+      if (!line) {
+        return undefined;
+      }
+      return { lineId: line.lineId, itemNo };
+    }
+
+    const index = this.state.cart.findIndex((line) => line.lineId === itemRef);
+    if (index < 0) {
+      return undefined;
+    }
+    const line = this.state.cart[index];
+    if (!line) {
+      return undefined;
+    }
+    return { lineId: line.lineId, itemNo: index + 1 };
   }
 
   private async cmdQuote(): Promise<void> {
@@ -2825,7 +2857,7 @@ function extractItemSkuOptions(data: unknown): ItemSkuOption[] {
   }
 
   if (options.length > 0) {
-    return options;
+    return expandSkuOptionsWithSpuAttributes(options, detailRoot);
   }
 
   const fallbackSkuId = asString(detailRoot.skuId);
@@ -2843,6 +2875,246 @@ function extractItemSkuOptions(data: unknown): ItemSkuOption[] {
         undefined
     }
   ];
+}
+
+interface SpuAttributeOptionChoice {
+  attributeOptionId: string;
+  name: string;
+  defaulted: boolean;
+}
+
+interface SpuAttributeGroup {
+  name: string;
+  options: SpuAttributeOptionChoice[];
+}
+
+interface AttributeSelectionCombo {
+  optionIds: string[];
+  labels: string[];
+}
+
+const MAX_ATTRIBUTE_COMBINATIONS = 512;
+
+function expandSkuOptionsWithSpuAttributes(
+  options: ItemSkuOption[],
+  detailRoot: Record<string, unknown>
+): ItemSkuOption[] {
+  const groups = extractSpuAttributeGroups(detailRoot);
+  if (groups.length === 0) {
+    return options;
+  }
+  const combos = enumerateAttributeSelectionCombos(groups, MAX_ATTRIBUTE_COMBINATIONS);
+  if (combos.length === 0) {
+    return options;
+  }
+
+  const out: ItemSkuOption[] = [];
+  const seen = new Set<string>();
+
+  for (const option of options) {
+    for (const combo of combos) {
+      const mergedAttributeList = mergeAttributeOptionIds(option.attributeList, combo.optionIds);
+      const variantParts: string[] = [];
+      const baseVariantText = option.specText ?? option.name;
+      if (baseVariantText) {
+        variantParts.push(baseVariantText);
+      }
+      if (combo.labels.length > 0) {
+        variantParts.push(combo.labels.join(" | "));
+      }
+      const mergedSpecText = variantParts.join(" | ");
+      const key = `${option.skuId}|${normalizedPairKey(option.specList)}|${normalizedAttributeKey(
+        mergedAttributeList
+      )}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      out.push({
+        ...option,
+        specText: mergedSpecText || option.specText,
+        attributeList: mergedAttributeList
+      });
+    }
+  }
+
+  return out.length > 0 ? out : options;
+}
+
+function extractSpuAttributeGroups(detailRoot: Record<string, unknown>): SpuAttributeGroup[] {
+  const rawGroups =
+    asArray(detailRoot.spuAttributeList) ??
+    asArray(detailRoot.attributeList) ??
+    asArray(detailRoot.spuAttributeGroups) ??
+    [];
+  const groups: SpuAttributeGroup[] = [];
+
+  for (const rawGroup of rawGroups) {
+    if (!rawGroup || typeof rawGroup !== "object") {
+      continue;
+    }
+    const groupObj = rawGroup as Record<string, unknown>;
+    const groupName =
+      asString(groupObj.name) ??
+      asString(groupObj.attributeName) ??
+      asString(groupObj.attrName) ??
+      "";
+    const rawItems =
+      asArray(groupObj.items) ??
+      asArray(groupObj.optionList) ??
+      asArray(groupObj.attributeOptions) ??
+      [];
+    const options: SpuAttributeOptionChoice[] = [];
+
+    for (const rawItem of rawItems) {
+      if (!rawItem || typeof rawItem !== "object") {
+        continue;
+      }
+      const itemObj = rawItem as Record<string, unknown>;
+      const attributeOptionId =
+        asString(itemObj.attributeOptionId) ??
+        asString(itemObj.optionId) ??
+        asString(itemObj.id);
+      const optionName =
+        asString(itemObj.name) ??
+        asString(itemObj.attributeOptionName) ??
+        asString(itemObj.optionName);
+      if (!attributeOptionId || !optionName) {
+        continue;
+      }
+      options.push({
+        attributeOptionId,
+        name: optionName,
+        defaulted: toBool(itemObj.defaulted) === true
+      });
+    }
+
+    if (options.length === 0) {
+      continue;
+    }
+
+    // Prefer default option first for a more intuitive starting row.
+    options.sort((a, b) => Number(b.defaulted) - Number(a.defaulted));
+    groups.push({
+      name: groupName || "Option",
+      options
+    });
+  }
+
+  return groups;
+}
+
+function enumerateAttributeSelectionCombos(
+  groups: SpuAttributeGroup[],
+  maxCombos: number
+): AttributeSelectionCombo[] {
+  if (groups.length === 0) {
+    return [{ optionIds: [], labels: [] }];
+  }
+  const estimatedCombos = groups.reduce(
+    (acc, group) => acc * Math.max(1, group.options.length),
+    1
+  );
+  if (estimatedCombos > maxCombos) {
+    const fallbackOptionIds: string[] = [];
+    const fallbackLabels: string[] = [];
+    for (const group of groups) {
+      const chosen = group.options.find((option) => option.defaulted) ?? group.options[0];
+      if (!chosen) {
+        continue;
+      }
+      fallbackOptionIds.push(chosen.attributeOptionId);
+      fallbackLabels.push(`${group.name}: ${chosen.name}`);
+    }
+    return [{ optionIds: fallbackOptionIds, labels: fallbackLabels }];
+  }
+
+  const out: AttributeSelectionCombo[] = [];
+  const walk = (groupIndex: number, optionIds: string[], labels: string[]): void => {
+    if (out.length >= maxCombos) {
+      return;
+    }
+    if (groupIndex >= groups.length) {
+      out.push({
+        optionIds: [...optionIds],
+        labels: [...labels]
+      });
+      return;
+    }
+    const group = groups[groupIndex];
+    if (!group || group.options.length === 0) {
+      walk(groupIndex + 1, optionIds, labels);
+      return;
+    }
+    for (const option of group.options) {
+      optionIds.push(option.attributeOptionId);
+      labels.push(`${group.name}: ${option.name}`);
+      walk(groupIndex + 1, optionIds, labels);
+      optionIds.pop();
+      labels.pop();
+      if (out.length >= maxCombos) {
+        break;
+      }
+    }
+  };
+
+  walk(0, [], []);
+  return out.length > 0 ? out : [{ optionIds: [], labels: [] }];
+}
+
+function mergeAttributeOptionIds(
+  base:
+    | Array<{
+        attributeOptionId: string;
+      }>
+    | undefined,
+  extraOptionIds: string[]
+): Array<{ attributeOptionId: string }> | undefined {
+  const merged: Array<{ attributeOptionId: string }> = [];
+  const seen = new Set<string>();
+  for (const item of base ?? []) {
+    const id = asString(item.attributeOptionId);
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    merged.push({ attributeOptionId: id });
+  }
+  for (const id of extraOptionIds) {
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    merged.push({ attributeOptionId: id });
+  }
+  return merged.length > 0 ? merged : undefined;
+}
+
+function normalizedPairKey(
+  pairs:
+    | Array<{
+        specId: string;
+        specOptionId: string;
+      }>
+    | undefined
+): string {
+  return (pairs ?? [])
+    .map((pair) => `${pair.specId}:${pair.specOptionId}`)
+    .sort()
+    .join("|");
+}
+
+function normalizedAttributeKey(
+  pairs:
+    | Array<{
+        attributeOptionId: string;
+      }>
+    | undefined
+): string {
+  return (pairs ?? [])
+    .map((pair) => pair.attributeOptionId)
+    .sort()
+    .join("|");
 }
 
 function normalizeItemDetailRoot(data: unknown): Record<string, unknown> | undefined {

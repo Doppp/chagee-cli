@@ -60,6 +60,17 @@ interface MouseContext {
   cartIndex: number;
   menuVariantOpen: boolean;
 }
+
+interface MouseRowSelection {
+  pane: "stores" | "menu" | "cart";
+  index: number;
+  menuVariantOpen: boolean;
+}
+
+interface LastMouseClick {
+  atMs: number;
+  selection: MouseRowSelection;
+}
 interface SlashCommandHint {
   command: string;
   description: string;
@@ -75,6 +86,7 @@ const ENABLE_MOUSE = "\u001b[?1000h\u001b[?1006h";
 const DISABLE_MOUSE = "\u001b[?1000l\u001b[?1006l";
 const LINE_ACTIVE = "\u0001";
 const LINE_SELECTED = "\u0002";
+const DOUBLE_CLICK_MS = 350;
 const STORE_PANE_RATIO = 0.38;
 const MENU_PANE_RATIO = 0.34;
 const SLASH_COMMANDS: SlashCommandHint[] = [
@@ -100,7 +112,7 @@ const SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "logout", description: "clear authenticated session" },
   { command: "locate", description: "precise browser geolocation for distance sorting" },
   { command: "stores", description: "list stores by distance/wait/cups/name" },
-  { command: "mouse on", description: "enable mouse clicks + wheel navigation" },
+  { command: "mouse on", description: "enable mouse click selection" },
   { command: "mouse off", description: "disable mouse capture" },
   { command: "watch on", description: "auto-refresh stores every few seconds" },
   { command: "watch off", description: "stop live store auto-refresh" },
@@ -109,8 +121,8 @@ const SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "menu", description: "fetch store menu" },
   { command: "item <spuId>", description: "show SKU options for an item", insert: "item " },
   { command: "add <skuId>", description: "add SKU into cart", insert: "add " },
-  { command: "qty <lineId> <n>", description: "change cart line quantity", insert: "qty " },
-  { command: "rm <lineId>", description: "remove cart line", insert: "rm " },
+  { command: "qty <item> <n>", description: "change cart item quantity", insert: "qty " },
+  { command: "rm <item>", description: "remove cart item", insert: "rm " },
   { command: "clear", description: "clear cart contents" },
   { command: "cart", description: "show cart lines and totals" },
   { command: "quote", description: "request price quote" },
@@ -150,6 +162,7 @@ function TuiRoot(): React.JSX.Element {
   const queueRef = useRef(Promise.resolve());
   const stoppingRef = useRef(false);
   const autoWatchStartedRef = useRef(false);
+  const lastMouseClickRef = useRef<LastMouseClick | undefined>(undefined);
 
   const prevOrderNoRef = useRef<string | undefined>(undefined);
   const prevPaymentStatusRef = useRef<string | undefined>(undefined);
@@ -171,7 +184,7 @@ function TuiRoot(): React.JSX.Element {
   const [showHelpPanel, setShowHelpPanel] = useState(false);
   const [helpScrollOffset, setHelpScrollOffset] = useState(0);
   const [watchEnabled, setWatchEnabled] = useState(false);
-  const [mouseEnabled, setMouseEnabled] = useState(false);
+  const [mouseEnabled, setMouseEnabled] = useState(true);
   const [logLines, setLogLines] = useState<string[]>([]);
   const [consoleScrollOffset, setConsoleScrollOffset] = useState(0);
   const [storeIndex, setStoreIndex] = useState(0);
@@ -411,6 +424,48 @@ function TuiRoot(): React.JSX.Element {
     [enqueue, pushLog]
   );
 
+  const activateMouseSelection = useCallback(
+    (selection: MouseRowSelection): void => {
+      if (selection.pane === "stores") {
+        const selected = stores[selection.index];
+        if (selected?.storeNo) {
+          executeCommand(`/use ${selected.storeNo}`);
+        }
+        return;
+      }
+
+      if (selection.pane === "menu") {
+        if (selection.menuVariantOpen && menuVariantPicker) {
+          const option = menuVariantPicker.options[selection.index];
+          if (!option) {
+            return;
+          }
+          executeCommand(
+            buildAddCommandForVariant(menuVariantPicker.row.item, option, menuVariantPicker.qty)
+          );
+          setMenuVariantPicker(undefined);
+          return;
+        }
+
+        const selected = menuRows[selection.index];
+        if (!selected) {
+          return;
+        }
+        openMenuVariantPicker(selected);
+        return;
+      }
+
+      if (selection.pane === "cart") {
+        const selected = cartLines[selection.index];
+        if (!selected) {
+          return;
+        }
+        executeCommand(`/qty ${selection.index + 1} ${Math.max(1, selected.qty + 1)}`);
+      }
+    },
+    [cartLines, executeCommand, menuRows, menuVariantPicker, openMenuVariantPicker, stores]
+  );
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -633,7 +688,9 @@ function TuiRoot(): React.JSX.Element {
           setStoreIndex,
           setMenuIndex,
           setCartIndex,
-          setMenuVariantPicker
+          setMenuVariantPicker,
+          lastMouseClickRef,
+          activateMouseSelection
         );
       }
     };
@@ -643,7 +700,7 @@ function TuiRoot(): React.JSX.Element {
       stdin.off("data", onData);
       stdout.write(DISABLE_MOUSE);
     };
-  }, [isRawModeSupported, mouseEnabled, ready, setRawMode, stdin, stdout]);
+  }, [activateMouseSelection, isRawModeSupported, mouseEnabled, ready, setRawMode, stdin, stdout]);
 
   useInput((input, key) => {
     if (key.ctrl && input === "c") {
@@ -693,11 +750,11 @@ function TuiRoot(): React.JSX.Element {
     if (focusPane === "cart") {
       const selected = cartLines[cartIndex];
       if (selected && (key.leftArrow || input === "-")) {
-        executeCommand(`/qty ${selected.lineId} ${Math.max(1, selected.qty - 1)}`);
+        executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty - 1)}`);
         return;
       }
       if (selected && (key.rightArrow || input === "+")) {
-        executeCommand(`/qty ${selected.lineId} ${Math.max(1, selected.qty + 1)}`);
+        executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty + 1)}`);
         return;
       }
     }
@@ -814,7 +871,7 @@ function TuiRoot(): React.JSX.Element {
       if (focusPane === "cart") {
         const selected = cartLines[cartIndex];
         if (selected) {
-          executeCommand(`/qty ${selected.lineId} ${Math.max(1, selected.qty + 1)}`);
+          executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty + 1)}`);
         }
       }
       return;
@@ -923,7 +980,7 @@ function TuiRoot(): React.JSX.Element {
       <Text color="gray">
         {mouseEnabled
           ? "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes, click to select."
-          : "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes. Run `/mouse on` for click/wheel pane navigation."}
+          : "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes. Run `/mouse on` for click pane navigation."}
       </Text>
 
       <Box height={layout.paneHeight}>
@@ -1270,6 +1327,7 @@ function buildMenuVariantPaneLines(
   width: number,
   maxLines: number
 ): string[] {
+  const footerRows = 6;
   const skuWidth = Math.max(
     8,
     "SKU".length,
@@ -1277,13 +1335,13 @@ function buildMenuVariantPaneLines(
   );
   const priceWidth = Math.max(5, "Price".length);
   const variantWidth = Math.max(8, width - (skuWidth + priceWidth + 6));
-  const visibleRows = Math.max(0, maxLines - 6);
+  const visibleRows = Math.max(0, maxLines - (3 + footerRows));
   const start = windowStart(picker.optionIndex, picker.options.length, visibleRows);
   const end = Math.min(picker.options.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
   const lines = [
     `${focused ? "›" : " "} ITEM ${truncate(picker.row.item.name, Math.max(8, width - 7))}`,
-    `  ${fit("SKU", skuWidth)} ${fit("Price", priceWidth)} ${fit("Variant", variantWidth)}`,
+    `  ${fit("SKU", skuWidth)} ${fit("Price", priceWidth)} ${fit("Selection", variantWidth)}`,
     `  ${divider}`
   ];
 
@@ -1299,9 +1357,16 @@ function buildMenuVariantPaneLines(
     lines.push(`${flags}  ${fit(option.skuId, skuWidth)} ${fit(price, priceWidth)} ${variant}`);
   }
 
+  const selectedOption = picker.options[picker.optionIndex];
+  const selectedSummary = selectedOption
+    ? selectedOption.specText ?? selectedOption.name ?? selectedOption.skuId
+    : "-";
+
   lines.push("");
-  lines.push(`Qty ${picker.qty}  Enter add  Esc back`);
-  lines.push(`Left/Right or +/- adjusts qty`);
+  lines.push(`Pick one row = full combo (size + ice + sweetness + add-ons).`);
+  lines.push(`Selected ${picker.optionIndex + 1}/${picker.options.length}: ${truncate(selectedSummary, Math.max(8, width - 15))}`);
+  lines.push(`Controls: Up/Down choose  +/- qty  Enter add  Esc back`);
+  lines.push(`Qty: ${picker.qty}`);
   return lines;
 }
 
@@ -1313,17 +1378,17 @@ function buildCartPaneLines(
   maxLines: number,
   quoteTotal?: string
 ): string[] {
-  const lineWidth = Math.max(5, "Line".length);
+  const itemWidth = Math.max(4, "Item".length, String(Math.max(1, cart.length)).length);
   const qtyWidth = Math.max(3, "Qty".length);
-  const nameWidth = Math.max(8, width - (lineWidth + qtyWidth + 6));
-  const fixedTailRows = 3;
+  const nameWidth = Math.max(8, width - (itemWidth + qtyWidth + 6));
+  const fixedTailRows = 4;
   const visibleRows = Math.max(0, maxLines - 3 - fixedTailRows);
   const start = windowStart(cartIndex, cart.length, visibleRows);
   const end = Math.min(cart.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
   const lines = [
     `${focused ? "›" : " "} CART (${cart.length})`,
-    `  ${fit("Line", lineWidth)} ${fit("Qty", qtyWidth)} ${fit("Name", nameWidth)}`,
+    `  ${fit("Item", itemWidth)} ${fit("Qty", qtyWidth)} ${fit("Name", nameWidth)}`,
     `  ${divider}`
   ];
   for (let i = start; i < end; i += 1) {
@@ -1335,7 +1400,7 @@ function buildCartPaneLines(
     const name = fit(line.name ?? line.skuId, nameWidth);
     const flags = isActive ? LINE_ACTIVE : "";
     lines.push(
-      `${flags}  ${fit(shortId(line.lineId, lineWidth), lineWidth)} ${fit(String(line.qty), qtyWidth)} ${name}`
+      `${flags}  ${fit(String(i + 1), itemWidth)} ${fit(String(line.qty), qtyWidth)} ${name}`
     );
   }
   if (start > 0 && lines.length > 1) {
@@ -1359,6 +1424,7 @@ function buildCartPaneLines(
   }, 0);
 
   lines.push("");
+  lines.push("Adjust: <-/- down  ->/+ up");
   lines.push(`Subtotal: ${subtotal > 0 ? subtotal.toFixed(2) : "-"}`);
   lines.push(`Quoted:   ${quoteTotal ?? "-"}`);
   return lines;
@@ -1458,12 +1524,13 @@ function handleMouseEvent(
   setStoreIndex: (updater: (prev: number) => number) => void,
   setMenuIndex: (updater: (prev: number) => number) => void,
   setCartIndex: (updater: (prev: number) => number) => void,
-  setMenuVariantPicker: React.Dispatch<React.SetStateAction<MenuVariantPickerState | undefined>>
+  setMenuVariantPicker: React.Dispatch<React.SetStateAction<MenuVariantPickerState | undefined>>,
+  lastMouseClickRef: React.MutableRefObject<LastMouseClick | undefined>,
+  onDoubleClickSelection: (selection: MouseRowSelection) => void
 ): void {
   const {
     layout,
     terminalCols,
-    focusPane,
     storesLen,
     menuLen,
     cartLen,
@@ -1475,42 +1542,8 @@ function handleMouseEvent(
   const paneBodyLines = Math.max(1, layout.paneHeight - 2);
   const dataStartY = layout.paneStart + 4;
 
-  if (event.type === "wheel_up") {
-    if (focusPane === "stores") {
-      setStoreIndex((prev) => clampIndex(prev - 1, storesLen));
-    } else if (focusPane === "menu") {
-      if (menuVariantOpen) {
-        setMenuVariantPicker((prev) => {
-          if (!prev) {
-            return prev;
-          }
-          return { ...prev, optionIndex: clampIndex(prev.optionIndex - 1, menuLen) };
-        });
-      } else {
-        setMenuIndex((prev) => clampIndex(prev - 1, menuLen));
-      }
-    } else if (focusPane === "cart") {
-      setCartIndex((prev) => clampIndex(prev - 1, cartLen));
-    }
-    return;
-  }
-  if (event.type === "wheel_down") {
-    if (focusPane === "stores") {
-      setStoreIndex((prev) => clampIndex(prev + 1, storesLen));
-    } else if (focusPane === "menu") {
-      if (menuVariantOpen) {
-        setMenuVariantPicker((prev) => {
-          if (!prev) {
-            return prev;
-          }
-          return { ...prev, optionIndex: clampIndex(prev.optionIndex + 1, menuLen) };
-        });
-      } else {
-        setMenuIndex((prev) => clampIndex(prev + 1, menuLen));
-      }
-    } else if (focusPane === "cart") {
-      setCartIndex((prev) => clampIndex(prev + 1, cartLen));
-    }
+  if (event.type === "wheel_up" || event.type === "wheel_down") {
+    // Keep wheel neutral; only clicks should affect panel/item selection.
     return;
   }
   if (event.type !== "press") {
@@ -1532,13 +1565,18 @@ function handleMouseEvent(
       );
       if (idx !== undefined) {
         setStoreIndex(() => idx);
+        trackMouseSelectionClick(
+          lastMouseClickRef,
+          { pane: "stores", index: idx, menuVariantOpen: false },
+          onDoubleClickSelection
+        );
       }
       return;
     }
     if (event.x <= boundaries.secondEnd) {
       setFocusPane("menu");
       const visibleRows = menuVariantOpen
-        ? Math.max(0, paneBodyLines - 6)
+        ? Math.max(0, paneBodyLines - 9)
         : Math.max(0, paneBodyLines - 3);
       const idx = resolveClickedIndex(event.y, dataStartY, menuIndex, menuLen, visibleRows);
       if (idx !== undefined) {
@@ -1552,14 +1590,24 @@ function handleMouseEvent(
         } else {
           setMenuIndex(() => idx);
         }
+        trackMouseSelectionClick(
+          lastMouseClickRef,
+          { pane: "menu", index: idx, menuVariantOpen },
+          onDoubleClickSelection
+        );
       }
       return;
     }
     setFocusPane("cart");
-    const visibleRows = Math.max(0, paneBodyLines - 6);
+    const visibleRows = Math.max(0, paneBodyLines - 7);
     const idx = resolveClickedIndex(event.y, dataStartY, cartIndex, cartLen, visibleRows);
     if (idx !== undefined) {
       setCartIndex(() => idx);
+      trackMouseSelectionClick(
+        lastMouseClickRef,
+        { pane: "cart", index: idx, menuVariantOpen: false },
+        onDoubleClickSelection
+      );
     }
     return;
   }
@@ -1589,6 +1637,32 @@ function resolveClickedIndex(
     return undefined;
   }
   return start + rowOffset;
+}
+
+function trackMouseSelectionClick(
+  lastMouseClickRef: React.MutableRefObject<LastMouseClick | undefined>,
+  selection: MouseRowSelection,
+  onDoubleClickSelection: (selection: MouseRowSelection) => void
+): void {
+  const now = Date.now();
+  const previous = lastMouseClickRef.current;
+  const isDoubleClick =
+    previous !== undefined &&
+    now - previous.atMs <= DOUBLE_CLICK_MS &&
+    previous.selection.pane === selection.pane &&
+    previous.selection.index === selection.index &&
+    previous.selection.menuVariantOpen === selection.menuVariantOpen;
+
+  if (isDoubleClick) {
+    lastMouseClickRef.current = undefined;
+    onDoubleClickSelection(selection);
+    return;
+  }
+
+  lastMouseClickRef.current = {
+    atMs: now,
+    selection
+  };
 }
 
 function computePaneBoundaries(cols: number): { firstEnd: number; secondEnd: number } {
@@ -1700,13 +1774,6 @@ function truncate(value: string, width: number): string {
     return value.slice(0, width);
   }
   return `${value.slice(0, width - 1)}…`;
-}
-
-function shortId(value: string, maxLen = 8): string {
-  if (value.length <= maxLen) {
-    return value;
-  }
-  return value.slice(0, maxLen);
 }
 
 function formatDistanceKm(distanceMeters: number | undefined): string {

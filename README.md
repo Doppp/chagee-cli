@@ -374,8 +374,8 @@ Simple flow commands:
 - `menu search "<text>"`
 - `item <spuId>`
 - `add <skuId> [qty=1] [spuId=...] [name=...] [price=...] [specList=<json>] [attributeList=<json>]`
-- `qty <lineId> <n>`
-- `rm <lineId>`
+- `qty <item> <n>`
+- `rm <item>`
 - `clear`
 - `cart`
 - `quote`
