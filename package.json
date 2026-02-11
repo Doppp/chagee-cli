@@ -1,0 +1,44 @@
+{
+  "name": "chagee-cli",
+  "version": "0.1.0",
+  "description": "Region-aware CHAGEE ordering CLI and TUI",
+  "type": "module",
+  "bin": {
+    "chagee": "dist/cli.js",
+    "chagee-tui": "dist/tui/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "tui": "tsx src/tui/cli.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "cli",
+    "typescript",
+    "chagee"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.2.2",
+    "@types/react": "^19.2.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "ink": "^6.7.0",
+    "react": "^19.2.4"
+  }
+}
