@@ -3,6 +3,7 @@
 MVP TypeScript CLI for CHAGEE ordering (region-aware, pickup-first).
 
 > Warning: This project is alpha and highly experimental. Use at your own risk.
+> Attribution: Every line of code in this repository is written by AI.
 
 This README is split into two tracks:
 
@@ -65,6 +66,12 @@ If you are only using the tool, use the compiled run path:
 npm install
 npm run build
 npm start
+```
+
+Before creating real orders, configure app ID outside source code:
+
+```bash
+export CHAGEE_APP_ID="<your-app-id>"
 ```
 
 Notes:
@@ -206,6 +213,7 @@ Mouse support:
 - `dry-run` is default: `place` will not create a real order.
 - `live` mode enables real order creation.
 - Use `live on` before placing a real order, then `live off` after.
+- Sensitive values (for example `appId`) must be supplied via environment/config, not hardcoded in repo.
 
 ### Region Profiles
 
@@ -232,6 +240,7 @@ Add custom regions by creating `~/.chagee-cli/regions.json`:
     "defaultPhoneCode": "+60",
     "currencyCode": "MYR",
     "currencySymbol": "RM",
+    "appId": "<your-app-id>",
     "timeZone": "Asia/Kuala_Lumpur",
     "deviceTimeZoneRegion": "Asia/Kuala_Lumpur",
     "timezoneOffset": "480",

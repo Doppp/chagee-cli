@@ -7,6 +7,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { inspect } from "node:util";
 
 import {
+  APP_ID_ENV_VAR,
   DEFAULT_REGION_CODE,
   buildRegionRegistry,
   getBuiltInRegionProfiles,
@@ -2052,6 +2053,11 @@ export class App {
       throw new Error("Missing auth or selected store");
     }
     const region = this.activeRegion();
+    if (!region.appId || region.appId === "REQUIRED_SET_CHAGEE_APP_ID") {
+      throw new Error(
+        `Missing region appId. Set ${APP_ID_ENV_VAR} or provide appId in ~/.chagee-cli/regions.json`
+      );
+    }
 
     const now = new Date();
 

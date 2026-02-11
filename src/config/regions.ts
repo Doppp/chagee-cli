@@ -33,6 +33,17 @@ export interface RegionProfileInput extends Partial<Omit<RegionProfile, "code">>
 }
 
 export const DEFAULT_REGION_CODE = "SG";
+export const APP_ID_ENV_VAR = "CHAGEE_APP_ID";
+const DEFAULT_APP_ID_PLACEHOLDER = "REQUIRED_SET_CHAGEE_APP_ID";
+
+function resolveDefaultAppId(): string {
+  const raw = process.env[APP_ID_ENV_VAR];
+  if (!raw) {
+    return DEFAULT_APP_ID_PLACEHOLDER;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_APP_ID_PLACEHOLDER;
+}
 
 const DEFAULT_PROFILE: RegionProfile = {
   code: DEFAULT_REGION_CODE,
@@ -58,7 +69,7 @@ const DEFAULT_PROFILE: RegionProfile = {
   deliveryType: 1,
   businessType: 1,
   userType: 3,
-  appId: "wx4f4f6e46fc890118",
+  appId: resolveDefaultAppId(),
   aid: "100001",
   apv: "3.22.0",
   isTakeaway: false
