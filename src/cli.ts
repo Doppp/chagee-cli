@@ -9,6 +9,7 @@ interface CliOptions {
   version: boolean;
   json: boolean;
   tui: boolean;
+  yolo: boolean;
   mode?: string;
   region?: string;
   commands: string[];
@@ -28,6 +29,7 @@ Options
   -h, --help                 Show help
   -v, --version              Show version
   --tui                      Start TUI mode
+  --yolo                     Enable shell ordering commands (unsafe)
   --json                     Enable JSON output before running commands
   --mode <dry-run|live>      Set mode before running commands
   --region <CODE>            Set region before running commands
@@ -36,6 +38,7 @@ Options
 Examples
   chagee --help
   chagee --version
+  chagee --yolo --tui
   chagee --region SG --mode dry-run
   chagee -c "status"
   chagee --json -c "region list" -c "status"
@@ -47,6 +50,7 @@ function parseArgs(argv: string[]): CliOptions {
     version: false,
     json: false,
     tui: false,
+    yolo: false,
     commands: [],
     errors: []
   };
@@ -81,6 +85,10 @@ function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === "--tui") {
       options.tui = true;
+      continue;
+    }
+    if (arg === "--yolo") {
+      options.yolo = true;
       continue;
     }
 
@@ -158,7 +166,7 @@ async function runWithOptions(options: CliOptions): Promise<void> {
 
   if (options.tui) {
     if (hasBootstrapCommands) {
-      const bootstrap = new App();
+      const bootstrap = new App({ yolo: options.yolo });
       await bootstrap.init();
       if (options.region) {
         await bootstrap.execute(`region set ${options.region}`);
@@ -172,11 +180,11 @@ async function runWithOptions(options: CliOptions): Promise<void> {
       await bootstrap.shutdown();
     }
     const mod = await import("./tui/index.js");
-    await mod.runTui();
+    await mod.runTui({ yolo: options.yolo });
     return;
   }
 
-  const app = new App();
+  const app = new App({ yolo: options.yolo });
   await app.init();
 
   if (options.region) {
@@ -204,12 +212,12 @@ async function runWithOptions(options: CliOptions): Promise<void> {
 
   if (interactiveTty) {
     const mod = await import("./tui/index.js");
-    await mod.runTui();
+    await mod.runTui({ yolo: options.yolo });
     return;
   }
 
   if (!hasBootstrapCommands) {
-    await runCliRepl();
+    await runCliRepl({ yolo: options.yolo });
   }
 }
 

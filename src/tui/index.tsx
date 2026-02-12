@@ -78,6 +78,7 @@ interface MouseContext {
   menuLen: number;
   menuVariantFooterRows: number;
   cartLen: number;
+  cartVisibleRows: number;
   storeIndex: number;
   menuIndex: number;
   cartIndex: number;
@@ -100,6 +101,8 @@ interface SlashCommandHint {
   insert?: string;
 }
 
+type TuiCommandSource = "shell" | "panel" | "system";
+
 const MAX_LOG_LINES = 500;
 const ENTER_ALT_SCREEN = "\u001b[?1049h";
 const LEAVE_ALT_SCREEN = "\u001b[?1049l";
@@ -109,32 +112,27 @@ const ENABLE_MOUSE = "\u001b[?1000h\u001b[?1006h";
 const DISABLE_MOUSE = "\u001b[?1000l\u001b[?1006l";
 const LINE_ACTIVE = "\u0001";
 const LINE_SELECTED = "\u0002";
+const LINE_FOOTER_SPLIT = "\u0003";
 const DOUBLE_CLICK_MS = 350;
-const MENU_VARIANT_FOOTER_ROWS = 6;
-const CART_DETAIL_ROWS = 3;
-const CART_FOOTER_ROWS = 3;
+const MENU_VARIANT_FOOTER_ROWS = 4;
+const CART_HEADER_ROWS = 3;
+const CART_FOOTER_ROWS = 2;
+const CART_DETAIL_ROWS = 7;
 const STORE_PANE_RATIO = 0.38;
 const MENU_PANE_RATIO = 0.34;
-const SLASH_COMMANDS: SlashCommandHint[] = [
+const ALL_SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "help", description: "show command help" },
   { command: "status", description: "show current session status" },
   {
-    command: "login <phone>",
-    description: "start WhatsApp OTP login (format: +6591234567)",
-    insert: "login "
-  },
-  { command: "login web", description: "open browser OAuth login helper flow" },
-  {
-    command: "login web auto",
-    description: "attach existing browser session and auto-capture token",
-    insert: "login web auto "
+    command: "login",
+    description: "guided login (reuse session, clipboard token, then browser capture)"
   },
   {
-    command: "login import <token>",
-    description: "import browser token after OAuth login",
-    insert: "login import "
+    command: "login token <token>",
+    description: "import explicit auth token from browser/devtools",
+    insert: "login token "
   },
-  { command: "otp <code>", description: "verify OTP for login", insert: "otp " },
+  { command: "otp <code>", description: "legacy OTP verify for login", insert: "otp " },
   { command: "logout", description: "clear authenticated session" },
   { command: "locate", description: "precise browser geolocation for distance sorting" },
   { command: "stores", description: "list stores by distance/wait/cups/name" },
@@ -157,15 +155,38 @@ const SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "place", description: "create order from quote/cart" },
   { command: "order", description: "show latest order state" },
   { command: "order cancel", description: "cancel latest order (if allowed)" },
+  { command: "pay", description: "guided payment (create/open payment link)" },
   { command: "pay status", description: "check payment status for latest order" },
   { command: "region list", description: "show configured region profiles" },
   { command: "region set <code>", description: "switch region and reset session", insert: "region set " },
   { command: "exit", description: "quit TUI session" }
 ];
 
-export async function runTui(): Promise<void> {
+const SHELL_ORDERING_ROOTS = new Set([
+  "use",
+  "wait",
+  "menu",
+  "item",
+  "cart",
+  "add",
+  "qty",
+  "rm",
+  "clear",
+  "quote",
+  "place",
+  "checkout",
+  "confirm",
+  "live"
+]);
+
+interface RunTuiOptions {
+  yolo?: boolean;
+}
+
+export async function runTui(options: RunTuiOptions = {}): Promise<void> {
+  const yolo = options.yolo === true;
   const restoreTerminal = enterInteractiveSession(process.stdout);
-  const instance = render(<TuiRoot />, { exitOnCtrlC: false });
+  const instance = render(<TuiRoot yolo={yolo} />, { exitOnCtrlC: false });
   const teardown = (): void => {
     instance.unmount();
   };
@@ -183,8 +204,12 @@ export async function runTui(): Promise<void> {
   }
 }
 
-function TuiRoot(): React.JSX.Element {
-  const appRef = useRef(new App());
+interface TuiRootProps {
+  yolo: boolean;
+}
+
+function TuiRoot(props: TuiRootProps): React.JSX.Element {
+  const appRef = useRef(new App({ yolo: props.yolo }));
   const queueRef = useRef(Promise.resolve());
   const stoppingRef = useRef(false);
   const autoWatchStartedRef = useRef(false);
@@ -235,13 +260,17 @@ function TuiRoot(): React.JSX.Element {
   const consoleLogsCapacity = Math.max(1, consoleRows - 1);
   const consoleMaxScrollOffset = Math.max(0, logLines.length - consoleLogsCapacity);
   const helpRowsCapacity = Math.max(1, consoleRows - 2);
-  const helpMaxScrollOffset = Math.max(0, SLASH_COMMANDS.length - helpRowsCapacity);
+  const slashCommands = useMemo(() => filterShellSlashCommands(props.yolo), [props.yolo]);
+  const helpMaxScrollOffset = Math.max(0, slashCommands.length - helpRowsCapacity);
 
   const stores = appState?.storesCache ?? [];
   const menuRows = useMemo(() => flattenMenuRows(appState?.menuCache ?? []), [appState?.menuCache]);
   const cartLines = appState?.cart ?? [];
   const phase: AppPhase = appState ? derivePhase(appState) : "UNAUTH";
-  const slashHints = useMemo(() => getSlashHints(commandInput), [commandInput]);
+  const slashHints = useMemo(
+    () => getSlashHints(commandInput, slashCommands),
+    [commandInput, slashCommands]
+  );
   const slashPaletteVisible =
     focusPane === "console" && commandInput.trimStart().startsWith("/") && slashHints.length > 0;
   const selectedSlashHint = slashHints[clampIndex(slashHintIndex, slashHints.length)];
@@ -254,6 +283,7 @@ function TuiRoot(): React.JSX.Element {
     menuLen: menuRows.length,
     menuVariantFooterRows: 0,
     cartLen: cartLines.length,
+    cartVisibleRows: 0,
     storeIndex,
     menuIndex,
     cartIndex,
@@ -299,24 +329,26 @@ function TuiRoot(): React.JSX.Element {
   );
 
   const executeCommand = useCallback(
-    (raw: string): void => {
+    (raw: string, source: TuiCommandSource = "shell"): void => {
       enqueue(async () => {
         const command = normalizeSlashCommand(raw);
         if (!command) {
           return;
         }
 
-        setHistoryCursor(null);
-        setCommandHistory((prev) => {
-          if (prev[prev.length - 1] === command) {
-            return prev;
-          }
-          const next = [...prev, command];
-          if (next.length > 200) {
-            return next.slice(-200);
-          }
-          return next;
-        });
+        if (source === "shell") {
+          setHistoryCursor(null);
+          setCommandHistory((prev) => {
+            if (prev[prev.length - 1] === command) {
+              return prev;
+            }
+            const next = [...prev, command];
+            if (next.length > 200) {
+              return next.slice(-200);
+            }
+            return next;
+          });
+        }
 
         if (command === "help") {
           setShowHelpPanel(true);
@@ -330,12 +362,12 @@ function TuiRoot(): React.JSX.Element {
 
         if (command === "mouse on") {
           setMouseEnabled(true);
-          pushLog("mouse capture ON");
+          pushLog("mouse capture ON (click navigation enabled; text selection may be limited)");
           return;
         }
         if (command === "mouse off") {
           setMouseEnabled(false);
-          pushLog("mouse capture OFF");
+          pushLog("mouse capture OFF (native text selection/copy enabled)");
           return;
         }
         if (command === "mouse") {
@@ -344,9 +376,9 @@ function TuiRoot(): React.JSX.Element {
         }
 
         setBusy(true);
-        pushLog(`cmd > /${command}`);
+        pushLog(`${source === "shell" ? "cmd" : source} > /${command}`);
         try {
-          const shouldExit = await appRef.current.execute(`/${command}`);
+          const shouldExit = await appRef.current.execute(`/${command}`, { source });
 
           if (command.startsWith("watch on") || command.startsWith("stores watch on")) {
             setWatchEnabled(true);
@@ -451,7 +483,7 @@ function TuiRoot(): React.JSX.Element {
       if (selection.pane === "stores") {
         const selected = stores[selection.index];
         if (selected?.storeNo) {
-          executeCommand(`/use ${selected.storeNo}`);
+          executeCommand(`/use ${selected.storeNo}`, "panel");
         }
         return;
       }
@@ -471,7 +503,8 @@ function TuiRoot(): React.JSX.Element {
               menuVariantPicker.row.item,
               transition.option,
               menuVariantPicker.qty
-            )
+            ),
+            "panel"
           );
           setMenuVariantPicker(undefined);
           return;
@@ -490,7 +523,7 @@ function TuiRoot(): React.JSX.Element {
         if (!selected) {
           return;
         }
-        executeCommand(`/qty ${selection.index + 1} ${Math.max(1, selected.qty + 1)}`);
+        executeCommand(`/qty ${selection.index + 1} ${Math.max(1, selected.qty + 1)}`, "panel");
       }
     },
     [cartLines, executeCommand, menuRows, menuVariantPicker, openMenuVariantPicker, stores]
@@ -506,11 +539,15 @@ function TuiRoot(): React.JSX.Element {
       refreshSnapshot();
       setReady(true);
       pushLog("Ready. Type /help.");
+      if (!props.yolo) {
+        pushLog("SAFE shell mode: ordering slash commands are disabled. Use panels or restart with --yolo.");
+      }
+      pushLog("mouse capture ON (click navigation enabled; run /mouse off for text selection)");
     })();
     return () => {
       cancelled = true;
     };
-  }, [pushLog, refreshSnapshot]);
+  }, [props.yolo, pushLog, refreshSnapshot]);
 
   useEffect(() => {
     if (!ready || autoWatchStartedRef.current) {
@@ -520,7 +557,9 @@ function TuiRoot(): React.JSX.Element {
     enqueue(async () => {
       setBusy(true);
       try {
-        await appRef.current.execute("/watch on interval=10 sort=distance quiet=1");
+        await appRef.current.execute("/watch on interval=10 sort=distance quiet=1", {
+          source: "system"
+        });
         setWatchEnabled(true);
         refreshSnapshot();
         pushLog("Live store updates ON (10s, sorted by distance).");
@@ -673,6 +712,9 @@ function TuiRoot(): React.JSX.Element {
     const menuVariantFooterRows = menuVariantPicker
       ? buildMenuVariantFooterLines(menuVariantPicker, menuPaneTextWidth).length + 1
       : 0;
+    const paneBodyLines = Math.max(1, layout.paneHeight - 2);
+    const cartAvailableBody = Math.max(0, paneBodyLines - CART_FOOTER_ROWS - CART_HEADER_ROWS);
+    const cartVisibleRows = Math.max(0, cartAvailableBody - CART_DETAIL_ROWS);
     mouseContextRef.current = {
       layout,
       terminalCols,
@@ -681,6 +723,7 @@ function TuiRoot(): React.JSX.Element {
       menuLen: activeMenuLen,
       menuVariantFooterRows,
       cartLen: cartLines.length,
+      cartVisibleRows,
       storeIndex,
       menuIndex: menuVariantPicker ? menuVariantPicker.choiceIndex : menuIndex,
       cartIndex,
@@ -694,6 +737,7 @@ function TuiRoot(): React.JSX.Element {
     menuIndex,
     menuRows.length,
     menuVariantPicker,
+    cartPaneTextWidth,
     menuPaneTextWidth,
     storeIndex,
     stores.length,
@@ -763,6 +807,39 @@ function TuiRoot(): React.JSX.Element {
       return;
     }
 
+    if (focusPane === "console" && key.ctrl && !key.meta) {
+      const lowered = input.toLowerCase();
+      if (lowered === "p" && commandHistory.length > 0) {
+        setHistoryCursor((prev) => {
+          const next = prev === null ? commandHistory.length - 1 : Math.max(0, prev - 1);
+          const cmd = commandHistory[next];
+          if (cmd) {
+            setCommandInput(cmd);
+          }
+          return next;
+        });
+        return;
+      }
+      if (lowered === "n" && commandHistory.length > 0) {
+        setHistoryCursor((prev) => {
+          if (prev === null) {
+            return null;
+          }
+          const next = prev + 1;
+          if (next >= commandHistory.length) {
+            setCommandInput("");
+            return null;
+          }
+          const cmd = commandHistory[next];
+          if (cmd) {
+            setCommandInput(cmd);
+          }
+          return next;
+        });
+        return;
+      }
+    }
+
     if (focusPane === "menu" && menuVariantPicker) {
       if (key.leftArrow || input === "-") {
         setMenuVariantPicker((prev) => {
@@ -787,20 +864,20 @@ function TuiRoot(): React.JSX.Element {
     if (focusPane === "cart") {
       const selected = cartLines[cartIndex];
       if (selected && (key.delete || key.backspace || input.toLowerCase() === "x")) {
-        executeCommand(`/rm ${cartIndex + 1}`);
+        executeCommand(`/rm ${cartIndex + 1}`, "panel");
         return;
       }
       if (selected && (key.leftArrow || input === "-")) {
         const nextQty = selected.qty - 1;
         if (nextQty <= 0) {
-          executeCommand(`/rm ${cartIndex + 1}`);
+          executeCommand(`/rm ${cartIndex + 1}`, "panel");
         } else {
-          executeCommand(`/qty ${cartIndex + 1} ${nextQty}`);
+          executeCommand(`/qty ${cartIndex + 1} ${nextQty}`, "panel");
         }
         return;
       }
       if (selected && (key.rightArrow || input === "+")) {
-        executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty + 1)}`);
+        executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty + 1)}`, "panel");
         return;
       }
     }
@@ -815,21 +892,7 @@ function TuiRoot(): React.JSX.Element {
           setHelpScrollOffset((prev) => Math.min(helpMaxScrollOffset, prev + 1));
           return;
         }
-        if (commandInput.length === 0) {
-          setConsoleScrollOffset((prev) => Math.min(consoleMaxScrollOffset, prev + 1));
-          return;
-        }
-        if (commandHistory.length === 0) {
-          return;
-        }
-        setHistoryCursor((prev) => {
-          const next = prev === null ? commandHistory.length - 1 : Math.max(0, prev - 1);
-          const cmd = commandHistory[next];
-          if (cmd) {
-            setCommandInput(cmd);
-          }
-          return next;
-        });
+        setConsoleScrollOffset((prev) => Math.min(consoleMaxScrollOffset, prev + 1));
         return;
       }
       moveSelection(-1);
@@ -845,25 +908,7 @@ function TuiRoot(): React.JSX.Element {
           setHelpScrollOffset((prev) => Math.max(0, prev - 1));
           return;
         }
-        if (commandInput.length === 0) {
-          setConsoleScrollOffset((prev) => Math.max(0, prev - 1));
-          return;
-        }
-        setHistoryCursor((prev) => {
-          if (prev === null) {
-            return null;
-          }
-          const next = prev + 1;
-          if (next >= commandHistory.length) {
-            setCommandInput("");
-            return null;
-          }
-          const cmd = commandHistory[next];
-          if (cmd) {
-            setCommandInput(cmd);
-          }
-          return next;
-        });
+        setConsoleScrollOffset((prev) => Math.max(0, prev - 1));
         return;
       }
       moveSelection(1);
@@ -891,7 +936,7 @@ function TuiRoot(): React.JSX.Element {
       if (focusPane === "stores") {
         const selected = stores[storeIndex];
         if (selected?.storeNo) {
-          executeCommand(`/use ${selected.storeNo}`);
+          executeCommand(`/use ${selected.storeNo}`, "panel");
         }
         return;
       }
@@ -910,7 +955,8 @@ function TuiRoot(): React.JSX.Element {
               menuVariantPicker.row.item,
               transition.option,
               menuVariantPicker.qty
-            )
+            ),
+            "panel"
           );
           setMenuVariantPicker(undefined);
           return;
@@ -925,7 +971,7 @@ function TuiRoot(): React.JSX.Element {
       if (focusPane === "cart") {
         const selected = cartLines[cartIndex];
         if (selected) {
-          executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty + 1)}`);
+          executeCommand(`/qty ${cartIndex + 1} ${Math.max(1, selected.qty + 1)}`, "panel");
         }
       }
       return;
@@ -1034,7 +1080,8 @@ function TuiRoot(): React.JSX.Element {
       <Box justifyContent="space-between">
         <Text color="white">
           Phase:{phase} Mode:{appState?.session.mode ?? "dry-run"} Region:
-          {appState?.session.region ?? "-"} Watch:{watchEnabled ? "ON" : "OFF"} Mouse:
+          {appState?.session.region ?? "-"} Shell:{props.yolo ? "YOLO" : "SAFE"} Watch:
+          {watchEnabled ? "ON" : "OFF"} Mouse:
           {mouseEnabled ? "ON" : "OFF"} Loc:
           {formatCoord(appState?.session.latitude)},{formatCoord(appState?.session.longitude)}
         </Text>
@@ -1080,6 +1127,7 @@ function TuiRoot(): React.JSX.Element {
         logLines={logLines}
         commandInput={commandInput}
         hints={slashHints}
+        slashCommands={slashCommands}
         selectedHintIndex={slashHintIndex}
         showHelpPanel={showHelpPanel}
         helpScrollOffset={helpScrollOffset}
@@ -1111,9 +1159,24 @@ function Pane(props: PaneProps): React.JSX.Element {
           ? "magentaBright"
           : "blueBright";
   const maxLines = Math.max(1, props.height - 2);
-  const content = props.lines.slice(0, maxLines);
-  while (content.length < maxLines) {
-    content.push("");
+  const splitIndex = props.lines.indexOf(LINE_FOOTER_SPLIT);
+  const content: string[] = [];
+
+  if (splitIndex >= 0) {
+    const rawBody = props.lines.slice(0, splitIndex);
+    const rawFooter = props.lines.slice(splitIndex + 1);
+    const footerCount = Math.min(maxLines, rawFooter.length);
+    const bodyCount = Math.max(0, maxLines - footerCount);
+    const body = rawBody.slice(0, bodyCount);
+    while (body.length < bodyCount) {
+      body.push("");
+    }
+    content.push(...body, ...rawFooter.slice(0, footerCount));
+  } else {
+    content.push(...props.lines.slice(0, maxLines));
+    while (content.length < maxLines) {
+      content.push("");
+    }
   }
 
   return (
@@ -1161,10 +1224,11 @@ function Pane(props: PaneProps): React.JSX.Element {
                   ? props.color
                   : "white";
         const activeStyle = isActive ? { backgroundColor: props.color } : {};
+        const renderedLine = line.length === 0 ? " " : line;
 
         return (
           <Text key={`${props.title}-${idx}`} color={color} bold={isPaneTitle || isColumnHeader} {...activeStyle}>
-            {line}
+            {renderedLine}
           </Text>
         );
       })}
@@ -1177,6 +1241,7 @@ interface ConsolePaneProps {
   logLines: string[];
   commandInput: string;
   hints: SlashCommandHint[];
+  slashCommands: SlashCommandHint[];
   selectedHintIndex: number;
   showHelpPanel: boolean;
   helpScrollOffset: number;
@@ -1214,13 +1279,15 @@ function ConsolePane(props: ConsolePaneProps): React.JSX.Element {
   const helpCommandWidth = Math.max(
     12,
     "Command".length,
-    ...SLASH_COMMANDS.map((hint) => `/${hint.command}`.length)
+    ...props.slashCommands.map((hint) => `/${hint.command}`.length)
   );
   const helpDescWidth = Math.max(8, props.width - helpCommandWidth - 2);
   const helpCapacity = Math.max(1, maxLines - 2);
-  const helpMaxOffset = Math.max(0, SLASH_COMMANDS.length - helpCapacity);
+  const helpMaxOffset = Math.max(0, props.slashCommands.length - helpCapacity);
   const helpOffset = Math.min(Math.max(0, props.helpScrollOffset), helpMaxOffset);
-  const visibleHelp = showHelp ? SLASH_COMMANDS.slice(helpOffset, helpOffset + helpCapacity) : [];
+  const visibleHelp = showHelp
+    ? props.slashCommands.slice(helpOffset, helpOffset + helpCapacity)
+    : [];
   const helpRowsUsed = showHelp ? Math.min(maxLines, 2 + visibleHelp.length) : 0;
   const helpFillerRows = showHelp ? Math.max(0, maxLines - helpRowsUsed) : 0;
 
@@ -1250,10 +1317,10 @@ function ConsolePane(props: ConsolePaneProps): React.JSX.Element {
       ) : showHelp ? (
         <>
           <Text color="blueBright">
-            {`› help (${Math.min(SLASH_COMMANDS.length, helpOffset + 1)}-${Math.min(
-              SLASH_COMMANDS.length,
+            {`› help (${Math.min(props.slashCommands.length, helpOffset + 1)}-${Math.min(
+              props.slashCommands.length,
               helpOffset + visibleHelp.length
-            )}/${SLASH_COMMANDS.length})`}
+            )}/${props.slashCommands.length})`}
           </Text>
           <Box flexDirection="row">
             <Text color="cyanBright">{fit("Command", helpCommandWidth)}</Text>
@@ -1271,7 +1338,7 @@ function ConsolePane(props: ConsolePaneProps): React.JSX.Element {
         </>
       ) : (
         textRows.map((line, idx) => (
-          <Text key={`console-${idx}`} color={line.startsWith("›") ? "blueBright" : "white"}>
+          <Text key={`console-${idx}`} color={consoleLineColor(line)}>
             {line}
           </Text>
         ))
@@ -1394,16 +1461,17 @@ function buildMenuVariantPaneLines(
 ): string[] {
   const stageChoices = getMenuVariantStageChoices(picker);
   const footerLines = buildMenuVariantFooterLines(picker, width);
-  const footerRows = footerLines.length + 1;
+  const footerBlock = ["", ...footerLines];
+  const bodyCapacity = Math.max(0, maxLines - footerBlock.length);
   const priceWidth = 7;
   const combosWidth = 6;
   const choiceWidth = Math.max(8, width - (priceWidth + combosWidth + 6));
-  const visibleRows = Math.max(0, maxLines - (3 + footerRows));
+  const visibleRows = Math.max(0, bodyCapacity - 3);
   const start = windowStart(picker.choiceIndex, stageChoices.length, visibleRows);
   const end = Math.min(stageChoices.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
 
-  const lines = [
+  const bodyLines = [
     `${focused ? "›" : " "} ITEM ${truncate(picker.row.item.name, Math.max(8, width - 7))}`,
     `  ${fit("Choice", choiceWidth)} ${fit("Price", priceWidth)} ${fit("Combos", combosWidth)}`,
     `  ${divider}`
@@ -1416,17 +1484,14 @@ function buildMenuVariantPaneLines(
     }
     const isActive = focused && i === picker.choiceIndex;
     const flags = isActive ? LINE_ACTIVE : "";
-    lines.push(
+    bodyLines.push(
       `${flags}  ${fit(choice.value, choiceWidth)} ${fit(
         choice.priceText,
         priceWidth
       )} ${fit(String(choice.combos), combosWidth)}`
     );
   }
-
-  lines.push("");
-  lines.push(...footerLines);
-  return lines;
+  return [...bodyLines, LINE_FOOTER_SPLIT, ...footerBlock];
 }
 
 function buildCartPaneLines(
@@ -1440,11 +1505,14 @@ function buildCartPaneLines(
   const itemWidth = Math.max(4, "Item".length, String(Math.max(1, cart.length)).length);
   const qtyWidth = Math.max(3, "Qty".length);
   const nameWidth = Math.max(8, width - (itemWidth + qtyWidth + 6));
-  const { detailsRows, visibleRows } = computeCartLayoutRows(maxLines);
+  const detailLinesAll = buildCartDetailLinesAll(cart, cartIndex, width);
+  const bodyCapacity = Math.max(0, maxLines - CART_FOOTER_ROWS);
+  const availableBody = Math.max(0, bodyCapacity - CART_HEADER_ROWS);
+  const visibleRows = Math.max(0, availableBody - CART_DETAIL_ROWS);
   const start = windowStart(cartIndex, cart.length, visibleRows);
   const end = Math.min(cart.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
-  const lines = [
+  const bodyLines = [
     `${focused ? "›" : " "} CART (${cart.length})`,
     `  ${fit("Item", itemWidth)} ${fit("Qty", qtyWidth)} ${fit("Name", nameWidth)}`,
     `  ${divider}`
@@ -1457,30 +1525,29 @@ function buildCartPaneLines(
     const isActive = focused && i === cartIndex;
     const name = fit(line.name ?? line.skuId, nameWidth);
     const flags = isActive ? LINE_ACTIVE : "";
-    lines.push(
+    bodyLines.push(
       `${flags}  ${fit(String(i + 1), itemWidth)} ${fit(String(line.qty), qtyWidth)} ${name}`
     );
   }
-  if (start > 0 && lines.length > 1) {
-    const header = lines[1];
+  if (start > 0 && bodyLines.length > 1) {
+    const header = bodyLines[1];
     if (header) {
-      lines[1] = `↑ ${header.slice(2)}`;
+      bodyLines[1] = `↑ ${header.slice(2)}`;
     }
   }
-  if (end < cart.length && lines.length > 0) {
-    const last = lines[lines.length - 1];
+  if (end < cart.length && bodyLines.length > 0) {
+    const last = bodyLines[bodyLines.length - 1];
     if (last) {
-      lines[lines.length - 1] = `↓${last.slice(1)}`;
+      bodyLines[bodyLines.length - 1] = `↓${last.slice(1)}`;
     }
   }
 
-  const renderedRows = Math.max(0, end - start);
-  const fillerRows = Math.max(0, visibleRows - renderedRows);
-  for (let i = 0; i < fillerRows; i += 1) {
-    lines.push("");
+  const adjustHintRows = cart.length > 0 ? 1 : 0;
+  const detailContentRows = Math.min(detailLinesAll.length, Math.max(0, CART_DETAIL_ROWS - adjustHintRows));
+  bodyLines.push(...detailLinesAll.slice(0, detailContentRows));
+  if (cart.length > 0) {
+    bodyLines.push("←→ qty  Del rm");
   }
-
-  lines.push(...buildCartDetailLines(cart, cartIndex, width, detailsRows));
 
   const subtotal = cart.reduce((acc, line) => {
     if (line.price === undefined) {
@@ -1489,97 +1556,95 @@ function buildCartPaneLines(
     return acc + line.price * line.qty;
   }, 0);
 
-  lines.push("Adjust: <-/- down (rm at 1)  ->/+ up  Del/x rm");
-  lines.push(`Subtotal: ${subtotal > 0 ? subtotal.toFixed(2) : "-"}`);
-  lines.push(`Quoted:   ${quoteTotal ?? "-"}`);
-  return lines;
+  const footerBlock = [
+    `Subtotal: ${subtotal > 0 ? subtotal.toFixed(2) : "-"}`,
+    `Quote total: ${quoteTotal ?? "(run /quote)"}`
+  ];
+  return [...bodyLines, LINE_FOOTER_SPLIT, ...footerBlock];
 }
 
-function computeCartLayoutRows(maxLines: number): { detailsRows: number; visibleRows: number } {
-  const detailsRows = Math.max(0, Math.min(CART_DETAIL_ROWS, maxLines - 3 - CART_FOOTER_ROWS));
-  const visibleRows = Math.max(0, maxLines - 3 - detailsRows - CART_FOOTER_ROWS);
-  return { detailsRows, visibleRows };
-}
-
-function buildCartDetailLines(
+function buildCartDetailLinesAll(
   cart: CartLine[],
   cartIndex: number,
-  width: number,
-  detailsRows: number
+  width: number
 ): string[] {
-  if (detailsRows <= 0) {
-    return [];
-  }
-
   const selected = cart[cartIndex];
-  const contentWidth = Math.max(8, width - 2);
+  const contentWidth = Math.max(8, width - 4);
   const lines: string[] = [];
 
   if (!selected) {
-    lines.push(truncate("Options: -", contentWidth));
+    lines.push(...wrapPaneLine("Options: -", contentWidth));
   } else {
     const rawSegments = (selected.variantText ?? "")
       .split("|")
       .map((part) => part.trim())
       .filter((part) => part.length > 0);
 
-    lines.push(truncate(`Options (Item ${cartIndex + 1}):`, contentWidth));
+    lines.push(...wrapPaneLine(`Options (Item ${cartIndex + 1}):`, contentWidth));
 
     if (rawSegments.length === 0) {
       if ((selected.specList?.length ?? 0) > 0 || (selected.attributeList?.length ?? 0) > 0) {
         const specCount = selected.specList?.length ?? 0;
         const attrCount = selected.attributeList?.length ?? 0;
-        lines.push(truncate(`  - ${specCount} spec(s), ${attrCount} attr(s)`, contentWidth));
+        lines.push(...wrapPaneLine(`  - ${specCount} spec(s), ${attrCount} attr(s)`, contentWidth));
       } else {
-        lines.push(truncate("  - none", contentWidth));
+        lines.push(...wrapPaneLine("  - none", contentWidth));
       }
     } else {
-      const maxOptionRows = Math.max(1, detailsRows - 1);
-      if (rawSegments.length <= maxOptionRows) {
-        for (const segment of rawSegments) {
-          lines.push(truncate(`  - ${segment}`, contentWidth));
-        }
-      } else {
-        const keepRows = Math.max(1, maxOptionRows - 1);
-        for (let i = 0; i < keepRows; i += 1) {
-          const segment = rawSegments[i];
-          if (segment) {
-            lines.push(truncate(`  - ${segment}`, contentWidth));
-          }
-        }
-        const hiddenCount = rawSegments.length - keepRows;
-        lines.push(truncate(`  +${hiddenCount} more`, contentWidth));
+      for (const segment of rawSegments) {
+        lines.push(...wrapPaneLine(`  - ${segment}`, contentWidth));
       }
     }
-  }
-
-  while (lines.length < detailsRows) {
-    lines.push("");
-  }
-  if (lines.length > detailsRows) {
-    return lines.slice(0, detailsRows);
   }
   return lines;
 }
 
-function getSlashHints(input: string): SlashCommandHint[] {
+function getSlashHints(input: string, slashCommands: SlashCommandHint[]): SlashCommandHint[] {
   const trimmed = input.trim();
   if (!trimmed.startsWith("/")) {
     return [];
   }
   const query = trimmed.slice(1).trim().toLowerCase();
   if (query.length === 0) {
-    return SLASH_COMMANDS.slice(0, 8);
+    return slashCommands.slice(0, 8);
   }
 
   const token = query.split(/\s+/)[0] ?? "";
-  const prefix = SLASH_COMMANDS.filter((hint) => hint.command.toLowerCase().startsWith(token));
-  const contains = SLASH_COMMANDS.filter(
+  const prefix = slashCommands.filter((hint) => hint.command.toLowerCase().startsWith(token));
+  const contains = slashCommands.filter(
     (hint) =>
       !prefix.includes(hint) &&
       (hint.command.toLowerCase().includes(token) || hint.description.toLowerCase().includes(query))
   );
   return [...prefix, ...contains].slice(0, 8);
+}
+
+function filterShellSlashCommands(yolo: boolean): SlashCommandHint[] {
+  if (yolo) {
+    return ALL_SLASH_COMMANDS;
+  }
+  return ALL_SLASH_COMMANDS.filter((hint) => !isShellOrderingHint(hint.command));
+}
+
+function isShellOrderingHint(command: string): boolean {
+  const normalized = command.trim().toLowerCase();
+  const [root, sub] = normalized.split(/\s+/, 2);
+  if (!root) {
+    return false;
+  }
+  if (SHELL_ORDERING_ROOTS.has(root)) {
+    return true;
+  }
+  if (root === "order") {
+    return sub === "cancel";
+  }
+  if (root === "pay") {
+    return sub === "start" || sub === "open";
+  }
+  if (root === "store") {
+    return sub === "use" || sub === "wait";
+  }
+  return false;
 }
 
 function slashInsertText(hint: SlashCommandHint): string {
@@ -1947,29 +2012,25 @@ function resolveMenuVariantOption(picker: MenuVariantPickerState): ItemSkuOption
 
 function buildMenuVariantFooterLines(picker: MenuVariantPickerState, width: number): string[] {
   const currentDimension = picker.dimensions[picker.stageIndex];
+  const stepLabel = `Step ${picker.stageIndex + 1}/${picker.dimensions.length}: ${currentDimension?.label ?? "Option"}`;
   const actionVerb = picker.stageIndex + 1 >= picker.dimensions.length ? "add" : "next";
-  const escAction = picker.stageIndex > 0 ? "prev step" : "close";
-  const resolvedOption = resolveMenuVariantOption(picker);
-  const resolvedText = resolvedOption
-    ? `${resolvedOption.skuId} @ ${
-        resolvedOption.price !== undefined ? resolvedOption.price.toFixed(2) : "-"
-      }`
-    : "-";
+  const escAction = picker.stageIndex > 0 ? "back" : "close";
   const lines: string[] = [];
 
-  lines.push(`Step ${picker.stageIndex + 1}/${picker.dimensions.length}: ${currentDimension?.label ?? "Option"}`);
-  lines.push("Current:");
+  const dividerPrefix = `── ${stepLabel} `;
+  const fill = Math.max(0, width - dividerPrefix.length);
+  lines.push(`${dividerPrefix}${"─".repeat(fill)}`);
+
   for (let i = 0; i < picker.dimensions.length; i += 1) {
     const dimension = picker.dimensions[i];
     if (!dimension) {
       continue;
     }
-    lines.push(`  ${dimension.label}: ${picker.selectedValues[i] ?? "?"}`);
+    const marker = i === picker.stageIndex ? "  ←" : "";
+    lines.push(` ${dimension.label}: ${picker.selectedValues[i] ?? "?"}${marker}`);
   }
-  lines.push(`Will add: ${resolvedText}`);
-  lines.push(`Controls: Up/Down choose  Enter ${actionVerb}  Esc ${escAction}`);
-  lines.push("          +/- qty");
-  lines.push(`Qty: ${picker.qty}`);
+
+  lines.push(`↑↓ select  ↵ ${actionVerb}  Esc ${escAction}  ±qty: ${picker.qty}`);
 
   return lines.flatMap((line) => wrapPaneLine(line, width));
 }
@@ -2068,6 +2129,7 @@ function handleMouseEvent(
     menuLen,
     menuVariantFooterRows,
     cartLen,
+    cartVisibleRows,
     storeIndex,
     menuIndex,
     cartIndex,
@@ -2135,8 +2197,7 @@ function handleMouseEvent(
       return;
     }
     setFocusPane("cart");
-    const { visibleRows } = computeCartLayoutRows(paneBodyLines);
-    const idx = resolveClickedIndex(event.y, dataStartY, cartIndex, cartLen, visibleRows);
+    const idx = resolveClickedIndex(event.y, dataStartY, cartIndex, cartLen, cartVisibleRows);
     if (idx !== undefined) {
       setCartIndex(() => idx);
       trackMouseSelectionClick(
@@ -2331,6 +2392,42 @@ function formatCoord(value: number | undefined): string {
 
 function stripAnsi(value: string): string {
   return value.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function consoleLineColor(line: string): string {
+  const message = line.replace(/^\d{2}:\d{2}:\d{2}\s+/, "");
+  if (line.startsWith("›")) {
+    return "blueBright";
+  }
+  if (/\bcmd > \//.test(message)) {
+    return "cyanBright";
+  }
+  if (/^API errcode=(?!0\b)/i.test(message)) {
+    return "redBright";
+  }
+  if (/\berror:/i.test(message)) {
+    return "redBright";
+  }
+  if (/\bwarn:/i.test(message) || /\bwarning\b/i.test(message)) {
+    return "yellowBright";
+  }
+  if (/\bnotice\b/i.test(message)) {
+    return "magentaBright";
+  }
+  if (/\busage:/i.test(message)) {
+    return "yellow";
+  }
+  if (
+    /\b(API errcode=0|Added item|Updated item|Removed item|Cart cleared|Quoted total|Order created|Logged in|Selected store|Mode set|Region set|Ready\.)\b/i.test(
+      message
+    )
+  ) {
+    return "greenBright";
+  }
+  if (/^\d{2}:\d{2}:\d{2}\s+/.test(line)) {
+    return "gray";
+  }
+  return "whiteBright";
 }
 
 function formatArg(arg: unknown): string {

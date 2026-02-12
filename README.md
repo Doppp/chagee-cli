@@ -12,36 +12,20 @@ This README is split into two tracks:
 
 ## Table of Contents
 
-- [Scope](#scope)
+- [Overview](#overview)
 - [Using the CLI](#using-the-cli)
-- [Prerequisites](#prerequisites)
-- [Install and Start](#install-and-start)
-- [CLI Flags](#cli-flags)
-- [Install as Global Command](#install-as-global-command)
-- [TUI Mode](#tui-mode)
-- [TUI Status Header](#tui-status-header)
-- [TUI Keybindings](#tui-keybindings)
-- [Safety Model](#safety-model)
-- [Region Profiles](#region-profiles)
-- [Quickstart (2 Minutes)](#quickstart-2-minutes)
-- [Full Ordering Walkthrough](#full-ordering-walkthrough)
-- [Store Capacity and Wait](#store-capacity-and-wait)
-- [Usage Command Reference](#usage-command-reference)
-- [Session and Prompt States](#session-and-prompt-states)
-- [Troubleshooting (Usage)](#troubleshooting-usage)
-- [FAQ](#faq)
-- [Example Session Transcript](#example-session-transcript)
-- [Non-Interactive Usage](#non-interactive-usage)
+- [Setup and Configuration](#setup-and-configuration)
+- [Important Login Path (Manual Token)](#important-login-path-manual-token)
+- [TUI Guide](#tui-guide)
+- [Ordering Workflows](#ordering-workflows)
+- [Command and State Reference](#command-and-state-reference)
+- [Troubleshooting and FAQ](#troubleshooting-and-faq)
 - [Developing chagee-cli](#developing-chagee-cli)
-- [Dev Commands](#dev-commands)
-- [Distribution (npm)](#distribution-npm)
-- [Project Structure](#project-structure)
-- [Contributor Notes](#contributor-notes)
 - [Contributing Guide](./CONTRIBUTING.md)
 - [License](./LICENSE)
-- [Notes](#notes)
+- [Project Notes](#project-notes)
 
-## Scope
+## Overview
 
 - Status: alpha, highly experimental. Use at your own risk.
 - Default region: Singapore (`SG`)
@@ -55,12 +39,14 @@ This README is split into two tracks:
 
 Use this section if your goal is to run the tool and place orders.
 
-### Prerequisites
+### Setup and Configuration
+
+#### Prerequisites
 
 - Node.js 20+
 - npm 10+
 
-### Install and Start
+#### Install and Start
 
 If you are only using the tool, use the compiled run path:
 
@@ -82,7 +68,31 @@ Notes:
 - On an interactive terminal, `chagee` starts the TUI by default.
 - `npm run dev` is mainly for development (hot-run via `tsx`).
 
-### CLI Flags
+### Important Login Path (Manual Token)
+
+If `login` cannot finish automatically, use this flow.
+
+1. Log in to `https://h5.chagee.com.sg/main` in your normal browser session.
+2. Open DevTools -> `Network`.
+3. Select any authenticated CHAGEE API request.
+4. Copy request header `authorization` value.
+5. In CLI, run one of:
+
+```text
+login token <token>
+# legacy aliases still accepted:
+login paste
+login import <token>
+```
+
+Notes:
+
+- `login paste` reads token from clipboard.
+- `login import` also accepts full copied header lines, for example:
+  `authorization: Bearer <token>`
+- After import, CLI validates token against profile endpoints before saving session.
+
+#### CLI Flags
 
 `chagee` supports startup flags:
 
@@ -90,6 +100,7 @@ Notes:
 chagee --help
 chagee --version
 chagee --tui
+chagee --tui --yolo
 chagee --json
 chagee --mode dry-run
 chagee --region SG
@@ -103,6 +114,7 @@ Supported options:
 - `-h, --help`
 - `-v, --version`
 - `--tui`
+- `--yolo` (enables shell ordering commands)
 - `--json`
 - `--mode <dry-run|live>`
 - `--region <CODE>`
@@ -112,8 +124,9 @@ Supported options:
 
 - `-h, --help`
 - `-v, --version`
+- `--yolo`
 
-### Install as Global Command
+#### Install as Global Command
 
 Install from local checkout:
 
@@ -142,7 +155,9 @@ Uninstall global command later:
 npm uninstall -g chagee-cli
 ```
 
-### TUI Mode
+### TUI Guide
+
+#### TUI Mode
 
 Start the pane-based TUI:
 
@@ -154,17 +169,18 @@ npm run tui
 
 The TUI is built with Ink + React and uses the same command engine and APIs as line mode.
 
-### TUI Status Header
+#### TUI Status Header
 
 Example:
 
-`Phase:UNAUTH Mode:live Region:SG Watch:ON Mouse:OFF Loc:1.3498,103.8489`
+`Phase:UNAUTH Mode:live Region:SG Shell:SAFE Watch:ON Mouse:ON Loc:1.3498,103.8489`
 
 Meaning:
 
 - `Phase`: current session phase (`UNAUTH`, `READY`, `ORDER_CREATED`, etc.).
 - `Mode`: command safety mode (`dry-run` or `live`).
 - `Region`: active region profile code (default `SG`).
+- `Shell`: `SAFE` (default) or `YOLO`.
 - `Watch`: whether auto-refresh store polling is active.
 - `Mouse`: whether TUI mouse handling is enabled.
 - `Loc`: current latitude/longitude used for store distance sorting and queries.
@@ -174,12 +190,13 @@ Notes:
 - `UNAUTH` + `live` can happen: login state and mode are independent.
 - Changing `mode`, `region`, `watch`, or `locate` updates this header.
 
-### TUI Keybindings
+#### TUI Keybindings
 
 - `Tab`: cycle focus forward (`stores -> menu -> cart -> console -> stores`)
 - `Shift+Tab`: cycle focus backward
 - `Up` / `Down` in `stores/menu/cart`: move selected row
-- `Up` / `Down` in `console`: scroll logs when input is empty, history when typing
+- `Up` / `Down` in `console`: scroll visible output/logs
+- `Ctrl+P` / `Ctrl+N` in `console`: previous/next command history
 - `Enter (console pane)`: run typed slash command
 - `Enter (stores pane)`: run `use <storeNo>`
 - `Enter (menu pane)`: open staged variant/customization picker; `Enter` advances stage and adds on final stage
@@ -189,7 +206,7 @@ Notes:
 - `Left` / `-` (cart pane): decrease selected line qty
 - `Right` / `+` (cart pane): increase selected line qty
 - `/`: jump to console input
-- `/mouse`: reports that mouse selection is disabled (text highlight/copy stays available)
+- `/mouse`: reports current mouse capture state
 - `Ctrl+C`: quit TUI
 
 Layout:
@@ -199,10 +216,14 @@ Layout:
 
 Console notes:
 
-- Slash commands are supported (`/login`, `/otp`, `/stores`, `/use`, `/add`, `/place`, etc.).
-- Mouse selection is disabled by default to keep terminal text highlight/copy accurate.
+- Slash commands are supported (`/login`, `/otp`, `/stores`, `/status`, etc.).
+- SAFE shell mode is default: ordering commands in shell are blocked unless app was started with `--yolo`.
+- Panel interactions still allow ordering flow in SAFE mode.
+- Mouse click capture is enabled by default for pane navigation.
+- Use `/mouse off` if you want native terminal text selection/copy behavior.
 - Store capacity auto-refresh starts on launch (`/watch on interval=10 sort=distance quiet=1`).
-- Location is auto-resolved on startup via IP geolocation (backend-side).
+- Location is validated on startup via IP geolocation for `default/ip` sessions. Browser/manual coordinates are preserved.
+- Distance heartbeat: backend re-checks IP geolocation every ~60s during store refresh for non-manual/non-browser sessions.
 - For higher precision, run `/locate` (browser geolocation) or set manually with:
   `stores lat=<your-lat> lng=<your-lng>`
 
@@ -210,14 +231,14 @@ Mouse support:
 
 - terminal text highlight/copy is preserved (no pane click selection)
 
-### Safety Model
+#### Safety Model
 
 - `dry-run` is default: `place` will not create a real order.
 - `live` mode enables real order creation.
 - Use `live on` before placing a real order, then `live off` after.
 - Sensitive values (for example `appId`) must be supplied via environment/config, not hardcoded in repo.
 
-### Region Profiles
+#### Region Profiles
 
 Built-in:
 
@@ -259,7 +280,9 @@ debug region list
 debug region set MY
 ```
 
-### Quickstart (2 Minutes)
+### Ordering Workflows
+
+#### Quickstart (2 Minutes)
 
 1. `status`
 2. `stores` (default sort is distance)
@@ -267,21 +290,19 @@ debug region set MY
 4. `menu search "jasmine"`
 5. `add <skuId> qty=1 spuId=<spuId>`
 6. `cart`
-7. `quote`
-8. `live on`
-9. `place`
+7. `pay`
 
 At this point the CLI creates order + payment intent and opens payment URL in browser.
 
-### Full Ordering Walkthrough
+#### Full Ordering Walkthrough
 
 Replace placeholders and run in sequence:
 
 ```text
 status
-login +6591234567
-# enter OTP from WhatsApp/SMS
-otp 123456
+login
+# if guided login cannot complete automatically:
+# login token <token>
 
 stores
 use <storeNo>
@@ -294,37 +315,55 @@ item <spuId>
 add <skuId> qty=1 spuId=<spuId> name="Jasmine Green Milk Tea"
 cart
 
-quote
-live on
-place
+pay
 pay status
 order
 ```
 
-### Browser OAuth Auto Login
+#### Guided Login (Default)
 
-For accounts where desktop OTP hits slider captcha, reuse your existing logged-in browser session:
+Use the default login command:
 
 ```text
-login web auto timeout=120 cdp=http://127.0.0.1:9222 phone=+6591234567
+login
 status
 ```
 
-Flow:
+Optional advanced form:
 
-1. You keep your own browser session already logged in at `https://h5.chagee.com.sg/main`.
-2. Start that browser with remote debugging enabled (example: `--remote-debugging-port=9222`).
-3. CLI attaches to the existing tab and captures `authorization` token from CHAGEE API traffic.
+```text
+login timeout=180 cdp=http://127.0.0.1:9222 open=0 phone=+6591234567
+```
+
+Flow (`login`):
+
+1. If a valid session already exists, CLI reuses it after profile verification.
+2. CLI checks clipboard for a token and verifies it.
+3. CLI tries browser-session capture by scanning common local CDP endpoints (`9222/9223/9333`).
 4. CLI verifies profile and stores authenticated session.
 
 Notes:
 
-- CLI does not open a new login browser flow for this mode.
-- If no CHAGEE tab is found, open `https://h5.chagee.com.sg/main` in your existing browser and retry.
-- Manual fallback remains:
-  `login import <token> [phone=+6591234567]`
+- CLI does not open a separate re-login flow. It reuses your existing browser session.
+- If CDP capture fails, use the manual token flow in
+  [Important Login Path (Manual Token)](#important-login-path-manual-token).
+- Legacy aliases still work: `login web ...`, `login import ...`, `login paste`.
 
-### Store Capacity and Wait
+#### Manual Token Import (No CDP)
+
+If CDP/remote-debugging is unavailable, import token manually:
+
+1. Log in at `https://h5.chagee.com.sg/main`.
+2. Open DevTools -> Network and select any authenticated CHAGEE API request.
+3. Copy the `authorization` header value.
+4. Run one of:
+   - `login token <token>`
+   - `login paste` (legacy, if token is already in clipboard)
+   - `login import <token>` (legacy)
+
+`login token` / `login import` both accept copied header lines like `authorization: Bearer ...`.
+
+#### Store Capacity and Wait
 
 Menu visibility:
 
@@ -344,26 +383,32 @@ Menu visibility:
 - `wait(min)`: estimated wait
 - `status`: store status text
 
-### How To Find `spuId` and `skuId`
+#### How To Find `spuId` and `skuId`
 
 - `menu search "<text>"` for item candidates (`spuId`).
 - `item <spuId>` for sellable SKUs (`skuId`).
 - Use returned `skuId` in `add`.
 
-### Usage Command Reference
+### Command and State Reference
+
+#### Usage Command Reference
 
 You can prefix any command with `/` (example: `/status`).
+
+SAFE shell mode (default):
+
+- These shell commands require startup flag `--yolo`:
+  `use`, `wait`, `menu`, `item`, `cart`, `add`, `qty`, `rm`, `clear`, `quote`, `live on|off`, `place`, `checkout`, `confirm`, `pay`, `order cancel`, `pay start`, `pay open` (including legacy `store use|wait`).
+- Panel-driven ordering in TUI remains available without `--yolo`.
 
 Simple flow commands:
 
 - `help`
 - `status`
 - `exit`
-- `login <phone-with-country-code>` (example: `+6591234567`)
-- `login web [open=1]`
-- `login web auto [timeout=120] [cdp=http://127.0.0.1:9222] [phone=+6591234567]`
-- `login import <token> [phone=+6591234567]`
-- `otp <code> [phone=<phone>] [phoneCode=<dial-code>]`
+- `login [timeout=120] [cdp=auto|http://127.0.0.1:9222] [open=1] [phone=+6591234567]`
+- `login token <token> [phone=+6591234567]`
+- `otp <code> [phone=<phone>] [phoneCode=<dial-code>]` (legacy OTP verify)
 - `logout`
 - `locate [timeout=60] [open=1]`
 - `stores [sort=distance|wait|cups|name] [lat=1.35] [lng=103.81]`
@@ -384,7 +429,8 @@ Simple flow commands:
 - `live on|off`
 - `place [open=1] [channelCode=H5] [payType=1]`
 - `order [show|cancel [force=1]]`
-- `pay [start|open|status]`
+- `pay [open=1] [channelCode=H5] [payType=1]` (guided)
+- `pay [status|open|start]`
 
 Cancel window notes:
 
@@ -404,12 +450,12 @@ Advanced/debug commands:
 
 Legacy commands (still supported):
 
-- `login start ...`, `login verify ...`
+- `login start ...`, `login verify ...`, `login web ...`, `login import ...`, `login paste`
 - `stores list ...`, `store use ...`, `store wait`
 - `cart add ...`, `cart set ...`, `cart show`
 - `checkout`, `confirm`, `order show`, `order cancel`, `pay start`, `pay open`, `pay status`
 
-### Session and Prompt States
+#### Session and Prompt States
 
 Session file:
 
@@ -431,62 +477,75 @@ Phases:
 - `ORDER_PAID`
 - `ORDER_CANCELED`
 
-### Troubleshooting (Usage)
+### Troubleshooting and FAQ
 
-1. OTP flow fails: confirm phone format for your region and retry `login +6591234567`.
-2. Slider captcha blocks desktop OTP: use `login web auto [timeout=120] [cdp=http://127.0.0.1:9222] [phone=+6591234567]` with your existing logged-in browser session.
+#### Troubleshooting (Usage)
+
+1. OTP flow fails: use guided `login`, or fallback to token import via [Important Login Path (Manual Token)](#important-login-path-manual-token).
+2. Slider captcha blocks desktop OTP: use `login` (guided token + browser flow), or manual token flow in [Important Login Path (Manual Token)](#important-login-path-manual-token).
 3. Wrong country defaults: run `debug region show` and `debug region set <code>`.
 4. Distance/order of stores seems wrong: run `status` to check `location.source`, then run `locate` and `stores`.
-5. `place` does not submit: switch to live with `live on`.
+5. `pay` did not create/open payment: ensure login + cart + selected store, then retry `pay`.
 6. Cart add fails: run `item <spuId>` and use a valid `skuId`.
 7. Need reset: delete `~/.chagee-cli/session.json` and restart.
 8. Need payloads: run `debug last-req`, `debug last-res`, `debug events`.
-9. Browser auto-login cannot find a debuggable tab: ensure browser is started with remote debugging and `h5.chagee.com.sg` is open.
+9. Browser session login cannot find a debuggable tab: run `login token <token>` after copying `authorization` from DevTools. See [Important Login Path (Manual Token)](#important-login-path-manual-token).
 
-### FAQ
+#### FAQ
 
 1. Where do drink customization options (size/ice/sweetness) come from?
+   A:
    From API data (`item` / goods detail response). The TUI does not hardcode these options.
 2. Why do different drinks show different customization steps?
+   A:
    Each product has its own option groups in API payloads. If a drink has fewer groups, fewer stages are shown.
 3. What is the staged picker order?
+   A:
    The picker prioritizes `Variant/Size` first, then `Ice`, then `Sweetness`, then other groups.
 4. How do I use the staged picker quickly?
+   A:
    `Up/Down` selects a value, `Enter` moves to next stage (or adds on final stage), `Esc` moves back, `+/-` adjusts quantity.
 5. Why are long lines wrapped in the picker?
+   A:
    To avoid hiding information. The footer now wraps lines instead of truncating with `...`.
 6. Do I need an order number to cancel an order?
+   A:
    Not in normal flow. `order cancel` targets the latest order in current session state.
 7. Is there a cancellation time limit?
+   A:
    Yes. Use `order show` to inspect `cancelByAt` and `cancelRemainingSec` (when returned by API).
 8. Do discounts/promo codes/member vouchers work?
+   A:
    Not currently. This CLI does not apply or manage discounts right now.
 9. Why do you want to do this?
+   A:
    Because I am extra.
 10. Are you trying to scam me?
+   A:
    Nope. I'm using this for my own use. Use it at your own risk but I am not trying to scam you.
 11. Is this stable for production usage?
+   A:
    No. This project is alpha and highly experimental; use at your own risk.
 12. Is this code AI-generated?
+   A:
    Yes. Every line of code in this repository is written by AI.
 
-### Example Session Transcript
+#### Example Session Transcript
 
 Representative run from the TUI console pane:
 
 ```text
-/login +6591234567
-/otp 123456
+/login
+# optional fallback:
+# /login token <token>
 /stores
 /use SG012
 /menu search "jasmine"
 /add 30077881 qty=1 spuId=20001123 name="Jasmine Green Milk Tea" price=5.9
-/quote
-/live on
-/place
+/pay
 ```
 
-### Non-Interactive Usage
+#### Non-Interactive Usage
 
 Quick checks via piped input:
 
@@ -564,7 +623,7 @@ chagee-tui
 - Keep user-facing safety defaults (`dry-run`) intact.
 - Validate with both interactive (`npm run dev`) and non-interactive (`printf ... | npm start`) flows.
 
-## Notes
+## Project Notes
 
 - API payload mapping is reverse-engineered and can change without notice.
 - Use live mode at your own risk.

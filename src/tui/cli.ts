@@ -13,7 +13,8 @@ Usage
 
 Options
   -h, --help       Show help
-  -v, --version    Show version`;
+  -v, --version    Show version
+  --yolo           Enable shell ordering commands`;
 
 function versionString(): string {
   try {
@@ -36,8 +37,14 @@ async function main(): Promise<void> {
     console.log(versionString());
     return;
   }
-  await runTui();
+  if (args.some((arg) => arg.startsWith("-") && arg !== "--yolo")) {
+    const unknown = args.find((arg) => arg.startsWith("-") && arg !== "--yolo");
+    console.error(`Unknown option: ${unknown}`);
+    process.exitCode = 1;
+    return;
+  }
+  const yolo = args.includes("--yolo");
+  await runTui({ yolo });
 }
 
 void main();
-

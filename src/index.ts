@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
@@ -49,16 +49,15 @@ import type {
 const HELP = `CHAGEE CLI (simple mode)
   Tip: slash prefix is accepted (example: /status)
   Warning: alpha + highly experimental; use at your own risk.
+  Safe shell mode blocks ordering commands unless launched with --yolo.
 
   help
   status
   exit
 
-  login <phone-with-country-code> (example: +6591234567)
-  login web [open=1]
-  login web auto [timeout=120] [cdp=http://127.0.0.1:9222] [phone=+6591234567]
-  login import <token> [phone=+6591234567]
-  otp <code> [phone=<phone>] [phoneCode=<dial-code>]
+  login [timeout=120] [cdp=auto|http://127.0.0.1:9222] [open=1] [phone=+6591234567]
+  login token <token> [phone=+6591234567]
+  otp <code> [phone=<phone>] [phoneCode=<dial-code>]  (legacy OTP verify)
   logout
 
   locate [timeout=60] [open=1]
@@ -83,17 +82,78 @@ const HELP = `CHAGEE CLI (simple mode)
   live on|off
   place [open=1] [channelCode=H5] [payType=1]
   order [show|cancel]
-  pay [start|open|status]
+  pay [open=1] [channelCode=H5] [payType=1]  (guided)
+  pay [status|open|start]
+
+  debug help`;
+
+const SAFE_HELP = `CHAGEE CLI (simple mode)
+  Tip: slash prefix is accepted (example: /status)
+  Warning: alpha + highly experimental; use at your own risk.
+  Shell mode: SAFE (ordering flow commands hidden; launch with --yolo to enable).
+
+  help
+  status
+  exit
+
+  login [timeout=120] [cdp=auto|http://127.0.0.1:9222] [open=1] [phone=+6591234567]
+  login token <token> [phone=+6591234567]
+  otp <code> [phone=<phone>] [phoneCode=<dial-code>]  (legacy OTP verify)
+  logout
+
+  locate [timeout=60] [open=1]
+  stores [sort=distance|wait|cups|name] [lat=1.35] [lng=103.81]
+  watch on|off [interval=10] [sort=distance|wait|cups|name] [quiet=1]
+
+  order [show]
+  pay [open=1] [channelCode=H5] [payType=1]  (guided; requires cart/order context)
+  pay [status]
 
   debug help`;
 
 type StoreSort = "distance" | "wait" | "cups" | "name";
+type CommandSource = "shell" | "panel" | "system";
+
+interface AppOptions {
+  yolo?: boolean;
+}
+
+interface ExecuteOptions {
+  source?: CommandSource;
+}
+
 interface BrowserLocation {
   latitude: number;
   longitude: number;
   accuracyMeters?: number;
 }
+
+type BrowserCaptureStatus =
+  | "success"
+  | "connect_error"
+  | "no_tabs"
+  | "no_chagee_tab"
+  | "no_debug_ws"
+  | "token_not_seen";
+
+interface BrowserTokenCaptureAttempt {
+  endpoint: string;
+  status: BrowserCaptureStatus;
+  reason?: string;
+  targetUrl?: string;
+  sampleTargets?: string[];
+  token?: string;
+}
+
+interface BrowserTokenCaptureResult {
+  token?: string;
+  endpoint?: string;
+  attempts: BrowserTokenCaptureAttempt[];
+}
+
 const LOCATION_SOURCES: readonly LocationSource[] = ["default", "ip", "browser", "manual"];
+const LOCATION_HEARTBEAT_MS = 60 * 1000;
+const LOCATION_CHANGE_EPSILON = 0.000001;
 
 export class App {
   private state: AppState = createInitialState();
@@ -109,6 +169,8 @@ export class App {
   private storesWatchSilent = false;
   private storesWatchSort: StoreSort = "distance";
   private itemSkuOptionsCacheByStore: Record<string, Record<string, ItemSkuOption[]>> = {};
+  private lastLocationHeartbeatAttemptAtMs = 0;
+  private readonly yoloMode: boolean;
 
   private readonly client = new ChageeClient(
     () => this.state.auth?.token ?? this.state.session.guestToken,
@@ -126,6 +188,10 @@ export class App {
       }
     }
   );
+
+  constructor(options: AppOptions = {}) {
+    this.yoloMode = options.yolo === true;
+  }
 
   async init(): Promise<void> {
     const customRegions = await loadCustomRegionProfiles();
@@ -179,8 +245,10 @@ export class App {
 
   async run(): Promise<void> {
     const interactive = Boolean(input.isTTY && output.isTTY);
+    const colorsEnabled = interactive && supportsCliColors(output);
+    const restoreOutputColors = interactive ? installInteractiveOutputColors(colorsEnabled) : () => {};
     if (interactive) {
-      this.banner();
+      this.banner(colorsEnabled);
     }
     const rl = createInterface({ input, output, terminal: interactive });
 
@@ -202,9 +270,7 @@ export class App {
       while (true) {
         let line = "";
         try {
-          line = await rl.question(
-            `${derivePhase(this.state)}:${this.state.session.mode}> `
-          );
+          line = await rl.question(this.renderPrompt(colorsEnabled));
         } catch {
           break;
         }
@@ -214,6 +280,7 @@ export class App {
           continue;
         }
 
+        this.echoShellCommand(trimmed, colorsEnabled);
         const shouldExit = await this.handle(trimmed);
         if (shouldExit) {
           break;
@@ -222,17 +289,40 @@ export class App {
     } finally {
       this.stopStoreWatch();
       rl.close();
+      restoreOutputColors();
     }
   }
 
-  private banner(): void {
-    console.log("chagee shell (`help` for commands, `exit` to quit)");
-    console.log("warning: alpha + highly experimental; use at your own risk.");
-    console.log(`session: ${sessionFilePath()}`);
-    console.log(`regions: ${regionFilePath()}`);
+  private banner(colorsEnabled: boolean): void {
+    console.log(colorText("chagee shell (`help` for commands, `exit` to quit)", ANSI_BRIGHT_CYAN, colorsEnabled));
+    console.log(colorText("warning: alpha + highly experimental; use at your own risk.", ANSI_BRIGHT_YELLOW, colorsEnabled));
+    if (this.yoloMode) {
+      console.log(colorText("shell mode: YOLO (ordering commands enabled)", ANSI_BRIGHT_MAGENTA, colorsEnabled));
+    } else {
+      console.log(
+        colorText(
+          "shell mode: SAFE (ordering commands disabled; relaunch with --yolo)",
+          ANSI_BRIGHT_MAGENTA,
+          colorsEnabled
+        )
+      );
+    }
+    console.log(colorText(`session: ${sessionFilePath()}`, ANSI_DIM, colorsEnabled));
+    console.log(colorText(`regions: ${regionFilePath()}`, ANSI_DIM, colorsEnabled));
   }
 
-  private async handle(raw: string): Promise<boolean> {
+  private renderPrompt(colorsEnabled: boolean): string {
+    const phase = colorText(derivePhase(this.state), ANSI_BRIGHT_CYAN, colorsEnabled);
+    const modeColor = this.state.session.mode === "live" ? ANSI_BRIGHT_YELLOW : ANSI_BRIGHT_GREEN;
+    const mode = colorText(this.state.session.mode, modeColor, colorsEnabled);
+    return `${phase}:${mode}> `;
+  }
+
+  private echoShellCommand(command: string, colorsEnabled: boolean): void {
+    console.log(colorText(`› ${command}`, ANSI_BRIGHT_BLUE, colorsEnabled));
+  }
+
+  private async handle(raw: string, source: CommandSource = "shell"): Promise<boolean> {
     const normalizedRaw = raw.trim().startsWith("/") ? raw.trim().slice(1) : raw;
     const tokens = tokenize(normalizedRaw);
     const [root, ...rest] = tokens;
@@ -240,10 +330,22 @@ export class App {
       return false;
     }
 
+    if (source === "shell" && !this.yoloMode && this.isShellOrderingCommand(root, rest)) {
+      if (root.toLowerCase() === "pay") {
+        console.log(
+          "Shell /pay in SAFE mode is allowed only when cart has items or an existing order/payment is present."
+        );
+      } else {
+        console.log("Shell ordering commands are disabled in SAFE mode.");
+        console.log("Use panel navigation in TUI, or relaunch with --yolo.");
+      }
+      return false;
+    }
+
     try {
       switch (root) {
         case "help":
-          console.log(HELP);
+          console.log(this.yoloMode ? HELP : SAFE_HELP);
           return false;
         case "exit":
         case "quit":
@@ -296,18 +398,7 @@ export class App {
           await this.cmdGuest(rest);
           return false;
         case "login":
-          if (
-            rest.length > 0 &&
-            rest[0] !== "start" &&
-            rest[0] !== "verify" &&
-            rest[0] !== "web" &&
-            rest[0] !== "oauth" &&
-            rest[0] !== "import"
-          ) {
-            await this.cmdLogin(["start", ...rest]);
-          } else {
-            await this.cmdLogin(rest);
-          }
+          await this.cmdLogin(rest);
           return false;
         case "logout":
           await this.cmdLogout();
@@ -368,11 +459,7 @@ export class App {
           }
           return false;
         case "pay":
-          if (rest.length === 0) {
-            await this.cmdPay(["status"]);
-          } else {
-            await this.cmdPay(rest);
-          }
+          await this.cmdPay(rest);
           return false;
         case "event":
         case "events":
@@ -715,92 +802,75 @@ export class App {
   }
 
   private async cmdLogin(rest: string[]): Promise<void> {
-    const sub = rest[0];
+    const subRaw = rest[0];
+    const sub = (subRaw ?? "").toLowerCase();
     const region = this.activeRegion();
-    if (sub === "web" || sub === "oauth") {
-      const parsed = parseKeyValueTokens(rest.slice(1));
-      const action = parsed.args[0];
-      const shouldOpen = parseBool(parsed.opts.open, false);
-      const phone = parsed.opts.phone;
-      const url = "https://h5.chagee.com.sg/main";
-      if (action === "auto") {
-        const timeoutSec = Math.max(
-          30,
-          Math.min(600, Math.floor(parseNum(parsed.opts.timeout, 120)))
-        );
-        const cdpBaseUrl = parsed.opts.cdp ?? process.env.CHAGEE_CDP_URL ?? "http://127.0.0.1:9222";
-        const refresh = parseBool(parsed.opts.refresh, true);
-        const token = await this.captureBrowserTokenFromExistingSession(
-          cdpBaseUrl,
-          url,
-          timeoutSec,
-          refresh
-        );
-        if (!token) {
-          console.log("Unable to capture auth token from existing browser session.");
-          console.log(
-            "Ensure Chrome is already running with your logged-in CHAGEE tab and remote debugging enabled."
-          );
-          console.log("Example: Google Chrome --remote-debugging-port=9222");
-          console.log("Fallback: login import <token> [phone=+6591234567]");
-          return;
-        }
-
-        const profileCheck = await this.ensureLoginProfile(token);
-        if (!profileCheck.ok) {
-          console.log(`Login web auto blocked: ${profileCheck.reason}`);
-          return;
-        }
-
-        this.state.auth = {
-          token,
-          userId: profileCheck.userId,
-          phoneRaw: phone,
-          phoneMasked: phone ? maskPhone(phone) : undefined
-        };
-        this.state.pendingLoginPhone = undefined;
-        await this.persist();
-        console.log(`Logged in via browser OAuth as userId=${profileCheck.userId}`);
-        console.log(`Profile verified via ${profileCheck.endpoint}`);
-        return;
-      }
-
-      if (shouldOpen) {
-        this.openUrl(url);
-      } else {
-        console.log(`Use existing logged-in browser tab at ${url}`);
-      }
-      console.log("No new browser login is required.");
-      console.log("Recommended: run `login web auto` to capture token from existing browser session.");
-      console.log("Manual fallback: login import <token> [phone=+6591234567]");
+    if (rest.length === 0 || isKeyValueToken(subRaw) || sub === "guided") {
+      const parsed = parseKeyValueTokens(sub === "guided" ? rest.slice(1) : rest);
+      await this.cmdLoginGuided(parsed.opts);
       return;
     }
 
-    if (sub === "import") {
+    if (sub === "token") {
       const parsed = parseKeyValueTokens(rest.slice(1));
-      const token = parsed.opts.token ?? parsed.args[0];
-      const phone = parsed.opts.phone;
+      const inputToken = parsed.opts.token ?? (parsed.args.length > 0 ? parsed.args.join(" ") : undefined);
+      const token = normalizeImportedAuthToken(inputToken);
       if (!token) {
-        console.log("Usage: login import <token> [phone=+6591234567]");
+        console.log("Usage: login token <token> [phone=+6591234567]");
+        this.printManualImportHelp();
         return;
       }
+      const ok = await this.loginWithToken(token, parsed.opts.phone, "token");
+      if (!ok) {
+        console.log("Token login failed. Retry with a valid token or run `login` for guided flow.");
+      }
+      return;
+    }
 
-      const profileCheck = await this.ensureLoginProfile(token);
-      if (!profileCheck.ok) {
-        console.log(`Login import blocked: ${profileCheck.reason}`);
+    if (sub === "web" || sub === "oauth") {
+      console.log("Legacy alias: `login web ...` detected. Prefer `login`.");
+      const parsed = parseKeyValueTokens(rest.slice(1));
+      const action = (parsed.args[0] ?? "auto").toLowerCase();
+      const forwardOpts = { ...parsed.opts };
+
+      if (action === "open") {
+        this.openUrl("https://h5.chagee.com.sg/main");
+        console.log("Use your existing logged-in browser session, then run `login`.");
         return;
       }
+      if (action !== "auto" && action !== "guided") {
+        console.log(
+          "Usage: login [timeout=120] [cdp=auto|http://127.0.0.1:9222] [open=1] [phone=+6591234567]"
+        );
+        return;
+      }
+      if (action === "auto") {
+        delete forwardOpts.auto;
+      }
+      await this.cmdLoginGuided(forwardOpts, { openByDefault: false });
+      return;
+    }
 
-      this.state.auth = {
-        token,
-        userId: profileCheck.userId,
-        phoneRaw: phone,
-        phoneMasked: phone ? maskPhone(phone) : undefined
-      };
-      this.state.pendingLoginPhone = undefined;
-      await this.persist();
-      console.log(`Logged in via browser token as userId=${profileCheck.userId}`);
-      console.log(`Profile verified via ${profileCheck.endpoint}`);
+    if (sub === "import" || sub === "paste") {
+      console.log("Legacy alias: use `login token <token>` or `login`.");
+      const parsed = parseKeyValueTokens(rest.slice(1));
+      const inputToken = parsed.opts.token ?? (parsed.args.length > 0 ? parsed.args.join(" ") : undefined);
+      let token = normalizeImportedAuthToken(inputToken);
+      if (!token) {
+        token = this.readAuthTokenFromClipboard();
+        if (token) {
+          console.log("Using auth token from clipboard.");
+        }
+      }
+      if (!token) {
+        console.log("Usage: login token <token> [phone=+6591234567]");
+        this.printManualImportHelp();
+        return;
+      }
+      const ok = await this.loginWithToken(token, parsed.opts.phone, "imported token");
+      if (!ok) {
+        console.log("Imported token could not be verified.");
+      }
       return;
     }
 
@@ -867,41 +937,270 @@ export class App {
       return;
     }
 
+    if (isLikelyPhoneToken(subRaw)) {
+      console.log("Legacy OTP flow detected. Prefer `login` guided flow.");
+      await this.cmdLogin(["start", ...rest]);
+      return;
+    }
+
     console.log(
-      "Usage: login <phone-with-country-code> | login web [open=1] | login web auto [timeout=120] [cdp=http://127.0.0.1:9222] [phone=+6591234567] | login import <token> [phone=+6591234567] | otp <code> [phone=<phone>] [phoneCode=<dial-code>] (example phone: +6591234567)"
+      "Usage: login [timeout=120] [cdp=auto|http://127.0.0.1:9222] [open=1] [phone=+6591234567] | login token <token> [phone=+6591234567] | logout"
     );
+    console.log("Legacy aliases still supported: login web|import|paste|start|verify, otp <code>.");
+  }
+
+  private async cmdLoginGuided(
+    opts: Record<string, string>,
+    behavior: { openByDefault?: boolean } = {}
+  ): Promise<void> {
+    const url = "https://h5.chagee.com.sg/main";
+    const phone = opts.phone;
+    const timeoutSec = Math.max(30, Math.min(600, Math.floor(parseNum(opts.timeout, 120))));
+    const refresh = parseBool(opts.refresh, true);
+    const explicitCdp = opts.cdp;
+    const shouldOpen = parseBool(opts.open, behavior.openByDefault ?? true);
+
+    if (this.state.auth?.token) {
+      const existing = this.state.auth;
+      const profileCheck = await this.ensureLoginProfile(existing.token, existing.userId);
+      if (profileCheck.ok) {
+        this.state.auth = {
+          token: existing.token,
+          userId: profileCheck.userId,
+          phoneRaw: phone ?? existing.phoneRaw,
+          phoneMasked: phone ? maskPhone(phone) : existing.phoneMasked
+        };
+        await this.persist();
+        console.log(`Already logged in as userId=${profileCheck.userId}`);
+        console.log(`Profile verified via ${profileCheck.endpoint}`);
+        return;
+      }
+      console.log(`Stored session is invalid (${profileCheck.reason}). Trying fresh login...`);
+    }
+
+    const clipboardToken = this.readAuthTokenFromClipboard();
+    if (clipboardToken) {
+      console.log("Found token in clipboard. Verifying...");
+      const ok = await this.loginWithToken(clipboardToken, phone, "clipboard token");
+      if (ok) {
+        return;
+      }
+      console.log("Clipboard token could not be verified. Trying browser session capture...");
+    }
+
+    if (shouldOpen) {
+      this.openUrl(url);
+    }
+    console.log(`Using existing browser session at ${url}`);
+    console.log("No separate browser login flow is launched by the CLI.");
+
+    const autoDetectCdp = parseCdpCandidateInput(explicitCdp).length === 0;
+    const cdpCandidates = buildCdpCandidateUrls(explicitCdp);
+    if (autoDetectCdp) {
+      console.log(`Scanning ${cdpCandidates.length} local CDP endpoint(s) for an active CHAGEE tab...`);
+    } else {
+      console.log(`Using CDP endpoint(s): ${cdpCandidates.join(", ")}`);
+    }
+    console.log(`Waiting up to ${timeoutSec}s for CHAGEE API auth headers...`);
+
+    const capture = await this.captureBrowserTokenFromExistingSession(
+      cdpCandidates,
+      url,
+      timeoutSec,
+      refresh
+    );
+    if (!capture.token) {
+      this.printBrowserLoginCaptureFailure(capture.attempts, url, timeoutSec, autoDetectCdp);
+      this.printManualImportHelp();
+      return;
+    }
+
+    console.log(`Captured auth token via ${capture.endpoint ?? "CDP"}`);
+    const ok = await this.loginWithToken(capture.token, phone, "browser OAuth");
+    if (!ok) {
+      console.log("Browser session token was captured but profile verification failed.");
+    }
+  }
+
+  private async loginWithToken(
+    token: string,
+    phone: string | undefined,
+    sourceLabel: string
+  ): Promise<boolean> {
+    const profileCheck = await this.ensureLoginProfile(token);
+    if (!profileCheck.ok) {
+      console.log(`Login via ${sourceLabel} blocked: ${profileCheck.reason}`);
+      return false;
+    }
+
+    this.state.auth = {
+      token,
+      userId: profileCheck.userId,
+      phoneRaw: phone,
+      phoneMasked: phone ? maskPhone(phone) : undefined
+    };
+    this.state.pendingLoginPhone = undefined;
+    await this.persist();
+    console.log(`Logged in via ${sourceLabel} as userId=${profileCheck.userId}`);
+    console.log(`Profile verified via ${profileCheck.endpoint}`);
+    return true;
   }
 
   private async captureBrowserTokenFromExistingSession(
+    cdpBaseUrls: string[],
+    loginUrl: string,
+    timeoutSec: number,
+    refresh: boolean
+  ): Promise<BrowserTokenCaptureResult> {
+    const attempts: BrowserTokenCaptureAttempt[] = [];
+    for (const cdpBaseUrl of cdpBaseUrls) {
+      const attempt = await this.captureBrowserTokenFromCdpEndpoint(
+        cdpBaseUrl,
+        loginUrl,
+        timeoutSec,
+        refresh
+      );
+      attempts.push(attempt);
+      if (attempt.status === "success" && attempt.token) {
+        return {
+          token: attempt.token,
+          endpoint: attempt.endpoint,
+          attempts
+        };
+      }
+    }
+    return { attempts };
+  }
+
+  private async captureBrowserTokenFromCdpEndpoint(
     cdpBaseUrl: string,
     loginUrl: string,
     timeoutSec: number,
     refresh: boolean
-  ): Promise<string | undefined> {
+  ): Promise<BrowserTokenCaptureAttempt> {
     const cdpUrl = normalizeCdpBaseUrl(cdpBaseUrl);
-    let target = await pickCdpTarget(cdpUrl, loginUrl);
+    let targets: CdpTarget[];
+    try {
+      targets = await listCdpTargets(cdpUrl);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        endpoint: cdpUrl,
+        status: "connect_error",
+        reason
+      };
+    }
+
+    if (targets.length === 0) {
+      return {
+        endpoint: cdpUrl,
+        status: "no_tabs"
+      };
+    }
+
+    const target = pickCdpTargetFromTargets(targets, loginUrl);
     if (!target) {
-      console.log("No CHAGEE tab found in current browser session.");
-      console.log(`Open ${loginUrl} in your already logged-in browser, then retry.`);
-      return undefined;
+      return {
+        endpoint: cdpUrl,
+        status: "no_chagee_tab",
+        sampleTargets: targets
+          .slice(0, 5)
+          .map((entry) => `${entry.type ?? "unknown"}:${entry.url ?? entry.title ?? "(blank)"}`)
+      };
     }
 
-    console.log(`Attaching to existing browser tab: ${target.url || "(blank tab)"}`);
     if (!target.webSocketDebuggerUrl) {
-      console.log("Selected tab has no debugger websocket URL.");
-      return undefined;
+      return {
+        endpoint: cdpUrl,
+        status: "no_debug_ws",
+        ...(target.url ? { targetUrl: target.url } : {})
+      };
     }
 
-    const captured = await waitForCdpAuthToken({
+    const token = await waitForCdpAuthToken({
       wsDebuggerUrl: target.webSocketDebuggerUrl,
       apiBase: this.activeRegion().apiBase,
       timeoutSec,
       refresh
     });
-    if (captured) {
-      console.log("Captured auth token from existing browser session.");
+    if (!token) {
+      return {
+        endpoint: cdpUrl,
+        status: "token_not_seen",
+        ...(target.url ? { targetUrl: target.url } : {})
+      };
     }
-    return captured;
+    return {
+      endpoint: cdpUrl,
+      status: "success",
+      ...(target.url ? { targetUrl: target.url } : {}),
+      token
+    };
+  }
+
+  private printBrowserLoginCaptureFailure(
+    attempts: BrowserTokenCaptureAttempt[],
+    loginUrl: string,
+    timeoutSec: number,
+    autoDetectCdp: boolean
+  ): void {
+    console.log("Unable to capture auth token from existing browser session.");
+    if (attempts.length === 0) {
+      console.log("No CDP endpoints were available to scan.");
+      return;
+    }
+
+    for (const attempt of attempts) {
+      console.log(`- ${attempt.endpoint}: ${describeBrowserCaptureAttempt(attempt, timeoutSec)}`);
+      if (attempt.status === "no_chagee_tab" && (attempt.sampleTargets?.length ?? 0) > 0) {
+        console.log(`  tabs: ${attempt.sampleTargets?.join(" | ")}`);
+      }
+    }
+
+    console.log(`Open ${loginUrl} in your already logged-in browser, then retry.`);
+    if (!attempts.some((attempt) => attempt.status !== "connect_error")) {
+      console.log("No endpoint was reachable.");
+      console.log("Start Chrome once with remote debugging enabled, then retry:");
+      console.log("  Google Chrome --remote-debugging-port=9222");
+    } else if (attempts.some((attempt) => attempt.status === "token_not_seen")) {
+      console.log("CHAGEE tab was found but no auth token was observed in time.");
+      console.log("Interact with the page (or increase timeout), then retry.");
+    }
+
+    if (autoDetectCdp) {
+      console.log("Optional: pass an explicit endpoint, e.g. `login cdp=http://127.0.0.1:9222`");
+    }
+    console.log("Fallback: login token <token> [phone=+6591234567] (or legacy: login paste / login import)");
+  }
+
+  private readAuthTokenFromClipboard(): string | undefined {
+    const attempts = clipboardReadCommands(process.platform);
+    for (const attempt of attempts) {
+      try {
+        const res = spawnSync(attempt.command, attempt.args, {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+        if (res.error || res.status !== 0) {
+          continue;
+        }
+        const token = normalizeImportedAuthToken(res.stdout);
+        if (token) {
+          return token;
+        }
+      } catch {
+        // Ignore and try next clipboard command.
+      }
+    }
+    return undefined;
+  }
+
+  private printManualImportHelp(): void {
+    console.log("Manual import quick guide:");
+    console.log("1) Log in at https://h5.chagee.com.sg/main");
+    console.log("2) Browser DevTools -> Network -> open any CHAGEE API request");
+    console.log("3) Copy request header `authorization` value");
+    console.log("4) Run `login token <token>` (or legacy: `login paste` / `login import <token>`)");
   }
 
   private async ensureLoginProfile(
@@ -1733,12 +2032,19 @@ export class App {
   }
 
   private async cmdPay(rest: string[]): Promise<void> {
-    const sub = rest[0];
-    const action = sub ?? "status";
+    const raw = rest[0];
+    const action = (raw ?? "go").toLowerCase();
+
+    if (!raw || isKeyValueToken(raw) || action === "go" || action === "now") {
+      const tokens = !raw || isKeyValueToken(raw) ? rest : rest.slice(1);
+      await this.cmdPayGuided(tokens);
+      return;
+    }
 
     if (action === "start") {
       if (!this.state.auth || !this.state.selectedStore || !this.state.order?.orderNo) {
-        console.log("pay start needs auth + selected store + existing order");
+        console.log("pay start needs auth + selected store + existing order.");
+        console.log("Run `pay` to perform guided payment.");
         return;
       }
       const region = this.activeRegion();
@@ -1783,7 +2089,7 @@ export class App {
     if (action === "open") {
       const url = this.state.payment?.payUrl;
       if (!url) {
-        console.log("No payUrl in state. Run `pay start` first.");
+        console.log("No payUrl in state. Run `pay` (guided) or `pay start` first.");
         return;
       }
       this.openUrl(url);
@@ -1791,8 +2097,17 @@ export class App {
     }
 
     if (action === "status") {
-      if (!this.state.auth || !this.state.selectedStore || !this.state.order?.orderNo) {
-        console.log("pay status needs auth + selected store + existing order");
+      if (!this.state.auth) {
+        console.log("Login required. Run `login` first.");
+        return;
+      }
+      if (!this.state.selectedStore) {
+        console.log("Select a store first.");
+        return;
+      }
+      if (!this.state.order?.orderNo) {
+        console.log("No order found in session.");
+        console.log("Run `pay` to create/open payment, then `pay status`.");
         return;
       }
       const res = await this.client.payResultList({
@@ -1822,7 +2137,76 @@ export class App {
       return;
     }
 
-    console.log("Usage: pay [start|open|status]");
+    console.log("Usage: pay [open=1] [channelCode=H5] [payType=1] | pay [status|open|start]");
+  }
+
+  private async cmdPayGuided(rest: string[]): Promise<void> {
+    const parsed = parseKeyValueTokens(rest);
+    const open = parsed.opts.open !== "0";
+
+    if (!this.state.auth) {
+      console.log("Login required. Run `login` first.");
+      return;
+    }
+    await this.ensureSelectedStoreForOrder("pay");
+    if (!this.state.selectedStore) {
+      console.log("Select a store first.");
+      return;
+    }
+
+    if (this.state.order?.status === "paid") {
+      console.log(`Order ${this.state.order.orderNo} is already marked as paid.`);
+      await this.cmdPay(["status"]);
+      return;
+    }
+
+    if (this.state.order?.orderNo) {
+      if (!this.state.payment?.payUrl) {
+        const startArgs = ["start"];
+        if (parsed.opts.channelCode) {
+          startArgs.push(`channelCode=${parsed.opts.channelCode}`);
+        }
+        if (parsed.opts.payType) {
+          startArgs.push(`payType=${parsed.opts.payType}`);
+        }
+        if (parsed.opts.extInfo) {
+          startArgs.push(`extInfo=${parsed.opts.extInfo}`);
+        }
+        await this.cmdPay(startArgs);
+      }
+
+      if (open) {
+        await this.cmdPay(["open"]);
+      }
+      await this.cmdPay(["status"]);
+      return;
+    }
+
+    if (this.state.cart.length === 0) {
+      console.log("Cart is empty.");
+      return;
+    }
+
+    if (this.state.session.mode !== "live") {
+      this.state.session.mode = "live";
+      await this.persist();
+      console.log("Switched mode to live for payment.");
+    }
+
+    const placeArgs: string[] = [];
+    if (!open) {
+      placeArgs.push("open=0");
+    }
+    if (parsed.opts.channelCode) {
+      placeArgs.push(`channelCode=${parsed.opts.channelCode}`);
+    }
+    if (parsed.opts.payType) {
+      placeArgs.push(`payType=${parsed.opts.payType}`);
+    }
+    await this.cmdPlace(placeArgs);
+    if (this.state.order?.orderNo) {
+      await this.cmdPay(["status"]);
+    }
   }
 
   private applyOrderCancelWindow(source: unknown): void {
@@ -1943,6 +2327,7 @@ export class App {
   }
 
   private async refreshStores(sortBy: StoreSort, silent: boolean): Promise<StoreState[]> {
+    await this.maybeRefreshLocationHeartbeat(silent);
     const region = this.activeRegion();
     const pageSize = 20;
     const params: {
@@ -2173,9 +2558,9 @@ export class App {
     }
 
     const latitudeChanged =
-      Math.abs(this.state.session.latitude - resolved.latitude) > 0.000001;
+      Math.abs(this.state.session.latitude - resolved.latitude) > LOCATION_CHANGE_EPSILON;
     const longitudeChanged =
-      Math.abs(this.state.session.longitude - resolved.longitude) > 0.000001;
+      Math.abs(this.state.session.longitude - resolved.longitude) > LOCATION_CHANGE_EPSILON;
     const sourceChanged = this.state.session.locationSource !== "ip";
     if (!latitudeChanged && !longitudeChanged && !sourceChanged) {
       return;
@@ -2194,6 +2579,48 @@ export class App {
         // Keep startup resilient if store refresh fails.
       }
     }
+    await this.persist();
+  }
+
+  private async maybeRefreshLocationHeartbeat(silent: boolean): Promise<void> {
+    const source = this.state.session.locationSource;
+    if (source === "manual" || source === "browser") {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - this.lastLocationHeartbeatAttemptAtMs < LOCATION_HEARTBEAT_MS) {
+      return;
+    }
+    this.lastLocationHeartbeatAttemptAtMs = now;
+
+    const resolved = await this.resolveLocationFromIp();
+    if (!resolved) {
+      return;
+    }
+
+    const latitudeChanged =
+      Math.abs(this.state.session.latitude - resolved.latitude) > LOCATION_CHANGE_EPSILON;
+    const longitudeChanged =
+      Math.abs(this.state.session.longitude - resolved.longitude) > LOCATION_CHANGE_EPSILON;
+    const sourceChanged = this.state.session.locationSource !== "ip";
+
+    if (!latitudeChanged && !longitudeChanged && !sourceChanged) {
+      return;
+    }
+
+    this.state.session.latitude = resolved.latitude;
+    this.state.session.longitude = resolved.longitude;
+    this.state.session.locationSource = "ip";
+    this.state.session.locationUpdatedAt = new Date(now).toISOString();
+    this.state.session.locationAccuracyMeters = resolved.accuracyMeters;
+
+    if (!silent) {
+      console.log(
+        `Location heartbeat: ${resolved.latitude.toFixed(6)},${resolved.longitude.toFixed(6)}`
+      );
+    }
+
     await this.persist();
   }
 
@@ -2460,8 +2887,8 @@ export class App {
     await saveSession(this.state);
   }
 
-  async execute(raw: string): Promise<boolean> {
-    return this.handle(raw);
+  async execute(raw: string, options: ExecuteOptions = {}): Promise<boolean> {
+    return this.handle(raw, options.source ?? "shell");
   }
 
   stateSnapshot(): AppState {
@@ -2474,7 +2901,75 @@ export class App {
 
   async shutdown(): Promise<void> {
     this.stopStoreWatch();
+    if (this.state.cart.length > 0 || this.state.quote || this.state.pendingCreatePayload) {
+      this.state.cart = [];
+      nextCartVersion(this.state);
+    }
     await this.persist();
+  }
+
+  private isShellOrderingCommand(root: string, rest: string[]): boolean {
+    const cmd = root.toLowerCase();
+    const sub = (rest[0] ?? "").toLowerCase();
+
+    if (
+      [
+        "use",
+        "wait",
+        "menu",
+        "item",
+        "add",
+        "qty",
+        "rm",
+        "clear",
+        "cart",
+        "quote",
+        "place",
+        "checkout",
+        "confirm",
+        "live"
+      ].includes(cmd)
+    ) {
+      return true;
+    }
+
+    if (cmd === "store") {
+      return sub === "use" || sub === "wait";
+    }
+
+    if (cmd === "order") {
+      return sub === "cancel";
+    }
+
+    if (cmd === "pay") {
+      if (sub === "status") {
+        return false;
+      }
+      if (sub === "start" || sub === "open") {
+        return true;
+      }
+
+      const isGuidedPay = sub === "" || sub === "go" || sub === "now" || isKeyValueToken(rest[0]);
+      if (isGuidedPay) {
+        return !this.canRunGuidedPayInSafeShell();
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  private canRunGuidedPayInSafeShell(): boolean {
+    if (this.state.cart.length > 0) {
+      return true;
+    }
+    if (Boolean(this.state.order?.orderNo)) {
+      return true;
+    }
+    if (Boolean(this.state.payment?.payUrl)) {
+      return true;
+    }
+    return false;
   }
 }
 
@@ -3585,10 +4080,97 @@ function isLocationSource(value: unknown): value is LocationSource {
   return typeof value === "string" && LOCATION_SOURCES.includes(value as LocationSource);
 }
 
-export async function runCliRepl(): Promise<void> {
-  const app = new App();
+const ANSI_RESET = "\u001b[0m";
+const ANSI_BRIGHT_BLUE = "\u001b[94m";
+const ANSI_BRIGHT_CYAN = "\u001b[96m";
+const ANSI_BRIGHT_GREEN = "\u001b[92m";
+const ANSI_BRIGHT_MAGENTA = "\u001b[95m";
+const ANSI_BRIGHT_YELLOW = "\u001b[93m";
+const ANSI_DIM = "\u001b[2m";
+const ANSI_RED = "\u001b[31m";
+const ANSI_YELLOW = "\u001b[33m";
+const ANSI_CYAN = "\u001b[36m";
+
+function supportsCliColors(stream: NodeJS.WriteStream): boolean {
+  if (!stream.isTTY) {
+    return false;
+  }
+  if (process.env.NO_COLOR !== undefined) {
+    return false;
+  }
+  return (process.env.TERM ?? "").toLowerCase() !== "dumb";
+}
+
+function colorText(value: string, code: string, enabled: boolean): string {
+  if (!enabled) {
+    return value;
+  }
+  return `${code}${value}${ANSI_RESET}`;
+}
+
+function installInteractiveOutputColors(enabled: boolean): () => void {
+  if (!enabled) {
+    return () => {};
+  }
+
+  const originalLog = console.log;
+  const originalInfo = console.info;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+
+  console.log = (...args: unknown[]): void => {
+    originalLog(...tintConsoleArgs(args, ANSI_BRIGHT_GREEN));
+  };
+  console.info = (...args: unknown[]): void => {
+    originalInfo(...tintConsoleArgs(args, ANSI_CYAN));
+  };
+  console.warn = (...args: unknown[]): void => {
+    originalWarn(...tintConsoleArgs(args, ANSI_YELLOW));
+  };
+  console.error = (...args: unknown[]): void => {
+    originalError(...tintConsoleArgs(args, ANSI_RED));
+  };
+
+  return () => {
+    console.log = originalLog;
+    console.info = originalInfo;
+    console.warn = originalWarn;
+    console.error = originalError;
+  };
+}
+
+function tintConsoleArgs(args: unknown[], colorCode: string): unknown[] {
+  if (args.length === 0) {
+    return args;
+  }
+
+  const first = args[0];
+  if (typeof first === "string") {
+    if (first.length === 0 || /\u001b\[[0-9;]*m/.test(first)) {
+      return args;
+    }
+    return [colorText(first, colorCode, true), ...args.slice(1)];
+  }
+  if (
+    typeof first === "number" ||
+    typeof first === "boolean" ||
+    typeof first === "bigint" ||
+    first === null ||
+    first === undefined
+  ) {
+    return [colorText(String(first), colorCode, true), ...args.slice(1)];
+  }
+  return args;
+}
+
+export async function runCliRepl(options: AppOptions = {}): Promise<void> {
+  const app = new App(options);
   await app.init();
-  await app.run();
+  try {
+    await app.run();
+  } finally {
+    await app.shutdown();
+  }
 }
 
 function safeOrigin(apiBase: string): string | undefined {
@@ -3605,6 +4187,113 @@ function normalizeCdpBaseUrl(input: string): string {
   return withProto.replace(/\/+$/, "");
 }
 
+interface ClipboardReadCommand {
+  command: string;
+  args: string[];
+}
+
+function clipboardReadCommands(platform: NodeJS.Platform): ClipboardReadCommand[] {
+  if (platform === "darwin") {
+    return [{ command: "pbpaste", args: [] }];
+  }
+  if (platform === "win32") {
+    return [
+      {
+        command: "powershell",
+        args: ["-NoProfile", "-Command", "Get-Clipboard -Raw"]
+      },
+      {
+        command: "pwsh",
+        args: ["-NoProfile", "-Command", "Get-Clipboard -Raw"]
+      }
+    ];
+  }
+  return [
+    { command: "wl-paste", args: ["-n"] },
+    { command: "xclip", args: ["-selection", "clipboard", "-out"] },
+    { command: "xsel", args: ["--clipboard", "--output"] }
+  ];
+}
+
+function normalizeImportedAuthToken(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const lines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) {
+    return undefined;
+  }
+
+  const picked =
+    lines.find((line) => /^authorization\s*[:=]\s*/i.test(line)) ??
+    lines[0] ??
+    "";
+  const withoutLabel = picked.replace(/^authorization\s*[:=]\s*/i, "").trim();
+  const token = withoutLabel.replace(/^["']|["']$/g, "").trim();
+  if (!token) {
+    return undefined;
+  }
+
+  const lower = token.toLowerCase();
+  if (lower === "null" || lower === "bearer null") {
+    return undefined;
+  }
+  return token;
+}
+
+function isKeyValueToken(raw: string | undefined): boolean {
+  if (!raw) {
+    return false;
+  }
+  return raw.includes("=");
+}
+
+function isLikelyPhoneToken(raw: string | undefined): boolean {
+  if (!raw) {
+    return false;
+  }
+  return /^\+?\d[\d\s-]{5,}$/.test(raw.trim());
+}
+
+const DEFAULT_CDP_ENDPOINTS = [
+  "http://127.0.0.1:9222",
+  "http://localhost:9222",
+  "http://127.0.0.1:9223",
+  "http://localhost:9223",
+  "http://127.0.0.1:9333",
+  "http://localhost:9333"
+];
+
+function parseCdpCandidateInput(input: string | undefined): string[] {
+  if (!input) {
+    return [];
+  }
+  return input
+    .split(/[\s,;]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && entry.toLowerCase() !== "auto")
+    .map(normalizeCdpBaseUrl);
+}
+
+function buildCdpCandidateUrls(explicitInput: string | undefined): string[] {
+  const explicit = parseCdpCandidateInput(explicitInput);
+  const envCandidates = parseCdpCandidateInput(process.env.CHAGEE_CDP_URL);
+  const queue = explicit.length > 0 ? explicit : [...envCandidates, ...DEFAULT_CDP_ENDPOINTS];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const candidate of queue) {
+    if (seen.has(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
+    out.push(candidate);
+  }
+  return out;
+}
+
 interface CdpTarget {
   id: string;
   type?: string;
@@ -3614,9 +4303,30 @@ interface CdpTarget {
 }
 
 async function listCdpTargets(cdpBaseUrl: string): Promise<CdpTarget[]> {
-  const res = await fetch(`${cdpBaseUrl}/json/list`);
+  const endpoints = ["/json/list", "/json"];
+  let lastError: Error | undefined;
+
+  for (const endpoint of endpoints) {
+    try {
+      const payload = await fetchCdpTargetsFromEndpoint(`${cdpBaseUrl}${endpoint}`);
+      if (payload.length > 0) {
+        return payload;
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+  return [];
+}
+
+async function fetchCdpTargetsFromEndpoint(url: string): Promise<CdpTarget[]> {
+  const res = await fetch(url);
   if (!res.ok) {
-    throw new Error(`CDP /json/list failed (${res.status})`);
+    throw new Error(`CDP ${url} failed (${res.status})`);
   }
   const payload = (await res.json()) as unknown;
   if (!Array.isArray(payload)) {
@@ -3625,29 +4335,75 @@ async function listCdpTargets(cdpBaseUrl: string): Promise<CdpTarget[]> {
   return payload.filter((entry) => entry && typeof entry === "object") as CdpTarget[];
 }
 
-async function pickCdpTarget(
-  cdpBaseUrl: string,
+function pickCdpTargetFromTargets(
+  targets: CdpTarget[],
   loginUrl: string
-): Promise<CdpTarget | undefined> {
-  let targets: CdpTarget[];
-  try {
-    targets = await listCdpTargets(cdpBaseUrl);
-  } catch {
+): CdpTarget | undefined {
+  const loginOrigin = safeOrigin(loginUrl);
+  const candidates = targets.filter((target) => {
+    if (!target.webSocketDebuggerUrl) {
+      return false;
+    }
+    const type = (target.type ?? "").toLowerCase();
+    return type === "page" || type === "webview" || type === "background_page" || type === "";
+  });
+  if (candidates.length === 0) {
     return undefined;
   }
-  const loginOrigin = safeOrigin(loginUrl);
-  const pages = targets.filter((target) => target.type === "page");
-  const preferred = pages.find((target) => {
+
+  const byOrigin = candidates.find((target) => {
     const url = target.url ?? "";
     if (!loginOrigin) {
-      return url.includes("h5.chagee.com.sg");
+      return false;
     }
     return url.startsWith(loginOrigin);
   });
-  if (preferred) {
-    return preferred;
+  if (byOrigin) {
+    return byOrigin;
   }
-  return pages[0];
+
+  const byChageeUrl = candidates.find((target) => {
+    const url = (target.url ?? "").toLowerCase();
+    return (
+      url.includes("h5.chagee.com") ||
+      url.includes("chagee.com.sg") ||
+      url.includes("chagee.com")
+    );
+  });
+  if (byChageeUrl) {
+    return byChageeUrl;
+  }
+
+  const byTitle = candidates.find((target) =>
+    (target.title ?? "").toLowerCase().includes("chagee")
+  );
+  if (byTitle) {
+    return byTitle;
+  }
+
+  return candidates[0];
+}
+
+function describeBrowserCaptureAttempt(
+  attempt: BrowserTokenCaptureAttempt,
+  timeoutSec: number
+): string {
+  switch (attempt.status) {
+    case "success":
+      return "token captured";
+    case "connect_error":
+      return `endpoint unreachable (${attempt.reason ?? "unknown error"})`;
+    case "no_tabs":
+      return "reachable, but no debuggable tabs";
+    case "no_chagee_tab":
+      return "reachable, but no CHAGEE tab";
+    case "no_debug_ws":
+      return "CHAGEE tab found without debugger websocket";
+    case "token_not_seen":
+      return `CHAGEE tab found, but no auth token observed within ${timeoutSec}s`;
+    default:
+      return "unknown capture state";
+  }
 }
 
 interface WaitForCdpAuthTokenOptions {
