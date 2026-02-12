@@ -1544,10 +1544,17 @@ function buildCartPaneLines(
 
   const adjustHintRows = cart.length > 0 ? 1 : 0;
   const detailContentRows = Math.min(detailLinesAll.length, Math.max(0, CART_DETAIL_ROWS - adjustHintRows));
-  bodyLines.push(...detailLinesAll.slice(0, detailContentRows));
+  const detailBlock: string[] = [...detailLinesAll.slice(0, detailContentRows)];
   if (cart.length > 0) {
-    bodyLines.push("←→ qty  Del rm");
+    detailBlock.push("←→ qty  Del rm");
   }
+
+  // Keep the options/detail area visually anchored above totals.
+  const spacerRows = Math.max(0, bodyCapacity - (bodyLines.length + detailBlock.length));
+  for (let i = 0; i < spacerRows; i += 1) {
+    bodyLines.push("");
+  }
+  bodyLines.push(...detailBlock);
 
   const subtotal = cart.reduce((acc, line) => {
     if (line.price === undefined) {
