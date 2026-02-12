@@ -142,8 +142,6 @@ const ALL_SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "logout", description: "clear authenticated session" },
   { command: "locate", description: "precise browser geolocation for distance sorting" },
   { command: "stores", description: "list stores by distance/wait/cups/name" },
-  { command: "mouse on", description: "enable mouse click selection" },
-  { command: "mouse off", description: "disable mouse capture" },
   { command: "watch on", description: "auto-refresh stores every few seconds" },
   { command: "watch off", description: "stop live store auto-refresh" },
   { command: "use <storeNo>", description: "choose active pickup store", insert: "use " },
@@ -241,7 +239,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
   const [showHelpPanel, setShowHelpPanel] = useState(false);
   const [helpScrollOffset, setHelpScrollOffset] = useState(0);
   const [watchEnabled, setWatchEnabled] = useState(false);
-  const [mouseEnabled, setMouseEnabled] = useState(true);
+  const [mouseEnabled, setMouseEnabled] = useState(false);
   const [logLines, setLogLines] = useState<string[]>([]);
   const [consoleScrollOffset, setConsoleScrollOffset] = useState(0);
   const [storeIndex, setStoreIndex] = useState(0);
@@ -385,29 +383,13 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
         setShowHelpPanel(false);
         setHelpScrollOffset(0);
 
-        if (command === "mouse on") {
-          setMouseEnabled(true);
-          pushLog("mouse capture ON (click navigation enabled; text selection may be limited)");
-          return;
-        }
-        if (command === "mouse off") {
-          disableMouseCaptureNow();
-          setMouseEnabled(false);
-          pushLog("mouse capture OFF (native text selection/copy enabled)");
-          return;
-        }
-        if (command === "mouse") {
-          pushLog(`mouse capture ${mouseEnabled ? "ON" : "OFF"}`);
-          return;
-        }
-
-        const commandRoot = (command.split(/\s+/, 1)[0] ?? "").toLowerCase();
-        if (commandRoot === "pay" && mouseEnabled) {
+        if (command === "mouse on" || command === "mouse off" || command === "mouse") {
           disableMouseCaptureNow();
           setMouseEnabled(false);
           pushLog(
-            "mouse capture AUTO-OFF for /pay (native text selection/copy enabled; run /mouse on to re-enable click navigation)"
+            "Mouse item selection is disabled. Use keyboard for panel navigation; mouse is reserved for native text selection/copy."
           );
+          return;
         }
 
         setBusy(true);
@@ -439,7 +421,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
         }
       });
     },
-    [disableMouseCaptureNow, enqueue, mouseEnabled, pushLog, refreshSnapshot, stopApp]
+    [disableMouseCaptureNow, enqueue, pushLog, refreshSnapshot, stopApp]
   );
 
   const focusCycle = useCallback(
@@ -566,15 +548,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
 
   const activateConsolePointerIntent = useCallback((): void => {
     setFocusPane("console");
-    if (!mouseEnabled) {
-      return;
-    }
-    disableMouseCaptureNow();
-    setMouseEnabled(false);
-    pushLog(
-      "mouse capture AUTO-OFF in shell area (drag again to select/copy; run /mouse on to re-enable click navigation)"
-    );
-  }, [disableMouseCaptureNow, mouseEnabled, pushLog]);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -589,9 +563,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       if (!props.yolo) {
         pushLog("SAFE shell mode: ordering slash commands are disabled. Use panels or restart with --yolo.");
       }
-      pushLog(
-        "mouse capture ON (click navigation enabled; click shell once to auto-enable text selection mode)"
-      );
+      pushLog("Keyboard-only panel navigation enabled. Mouse is reserved for native text selection/copy.");
     })();
     return () => {
       cancelled = true;
@@ -1136,8 +1108,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
         <Text color="white">
           Phase:{phase} Mode:{appState?.session.mode ?? "dry-run"} Region:
           {appState?.session.region ?? "-"} Shell:{props.yolo ? "YOLO" : "SAFE"} Watch:
-          {watchEnabled ? "ON" : "OFF"} Mouse:
-          {mouseEnabled ? "ON" : "OFF"} Loc:
+          {watchEnabled ? "ON" : "OFF"} Mouse:text-select Loc:
           {formatCoord(appState?.session.latitude)},{formatCoord(appState?.session.longitude)}
         </Text>
         <Text color="magentaBright">
@@ -1145,9 +1116,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
         </Text>
       </Box>
       <Text color="gray">
-        {mouseEnabled
-          ? "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes, click to select. Click shell once to unlock native text selection."
-          : "Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes. Run `/mouse on` for click pane navigation."}
+        Slash shell: type `/` to focus input, Enter to run, Tab to cycle panes. Use keyboard for panel/item selection; mouse is for text highlight/copy.
       </Text>
 
       <Box height={layout.paneHeight}>
@@ -1500,7 +1469,7 @@ function buildMenuPaneLines(
     if (sectionKey !== currentSectionKey) {
       currentSectionKey = sectionKey;
       displayRows.push({
-        text: `[${sectionName}]`,
+        text: sectionName,
         isHeader: true
       });
     }
