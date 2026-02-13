@@ -231,7 +231,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [appState, setAppState] = useState<AppState>();
-  const [focusPane, setFocusPane] = useState<FocusPane>("console");
+  const [focusPane, setFocusPane] = useState<FocusPane>("stores");
   const [commandInput, setCommandInput] = useState("");
   const [commandHistory, setCommandHistory] = useState<string[]>([]);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
