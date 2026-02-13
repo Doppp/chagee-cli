@@ -3468,6 +3468,12 @@ function extractItemSkuOptions(data: unknown): ItemSkuOption[] {
   if (!detailRoot) {
     return [];
   }
+  if (isMenuItemOutOfStock(detailRoot)) {
+    return [];
+  }
+
+  const rootSpuType = (asString(detailRoot.spuType) ?? "").trim().toLowerCase();
+  const rootIsCombo = rootSpuType === "combo";
 
   const rootName = asString(detailRoot.name) ?? asString(detailRoot.spuName) ?? "";
   const comboOptions = extractComboItemSkuOptions(detailRoot, rootName);
@@ -3487,7 +3493,8 @@ function extractItemSkuOptions(data: unknown): ItemSkuOption[] {
       continue;
     }
     const sku = rawSku as Record<string, unknown>;
-    if (isMenuItemOutOfStock(sku)) {
+    const normalizedSku = rootIsCombo ? { ...sku, spuType: "combo" } : sku;
+    if (isMenuItemOutOfStock(normalizedSku)) {
       continue;
     }
 
@@ -3549,6 +3556,28 @@ function extractComboItemSkuOptions(
   detailRoot: Record<string, unknown>,
   rootName: string
 ): ItemSkuOption[] {
+  const rootSpuType = (asString(detailRoot.spuType) ?? "").trim().toLowerCase();
+  const rootIsCombo = rootSpuType === "combo";
+  if (rootIsCombo) {
+    const skuList =
+      asArray(detailRoot.skuList) ??
+      asArray(detailRoot.goodsSkuList) ??
+      asArray(detailRoot.saleSkuList) ??
+      [];
+    if (skuList.length > 0) {
+      const hasAvailableBundleSku = skuList.some((rawSku) => {
+        if (!rawSku || typeof rawSku !== "object") {
+          return false;
+        }
+        const sku = rawSku as Record<string, unknown>;
+        return !isMenuItemOutOfStock({ ...sku, spuType: "combo" });
+      });
+      if (!hasAvailableBundleSku) {
+        return [];
+      }
+    }
+  }
+
   const primarySku = pickPrimarySkuRecord(detailRoot);
   const bundleSkuId = asString(primarySku?.skuId) ?? asString(detailRoot.skuId);
   if (!bundleSkuId) {
@@ -4210,20 +4239,24 @@ function parseOptionNames(rawList: unknown): string[] {
 }
 
 function isMenuItemOutOfStock(obj: Record<string, unknown>): boolean {
+  const spuType = (asString(obj.spuType) ?? "").trim().toLowerCase();
+  const isCombo = spuType === "combo";
+  const stockLimited = toBool(obj.stockLimit) === true;
+
   const explicitSaleOut = toBool(obj.saleOut);
-  if (explicitSaleOut !== undefined) {
-    return explicitSaleOut;
+  if (explicitSaleOut === true) {
+    return true;
   }
 
   const explicitSoldOut =
     toBool(obj.soldOut) ?? toBool(obj.isSoldOut) ?? toBool(obj.outOfStock);
-  if (explicitSoldOut !== undefined) {
-    return explicitSoldOut;
+  if (explicitSoldOut === true) {
+    return true;
   }
 
   const canSale = toBool(obj.canSale) ?? toBool(obj.available) ?? toBool(obj.isAvailable);
-  if (canSale !== undefined) {
-    return !canSale;
+  if (canSale === false) {
+    return true;
   }
 
   const status = toNum(obj.status) ?? toNum(obj.goodsStatus) ?? toNum(obj.saleStatus);
@@ -4237,7 +4270,7 @@ function isMenuItemOutOfStock(obj: Record<string, unknown>): boolean {
     toNum(obj.availableNum) ??
     toNum(obj.remainNum) ??
     toNum(obj.inventory);
-  if (stock !== undefined && stock <= 0) {
+  if ((isCombo || stockLimited) && stock !== undefined && stock <= 0) {
     return true;
   }
 
