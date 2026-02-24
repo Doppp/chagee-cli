@@ -26,6 +26,7 @@ import { maskPhone, printTable, toNum } from "./lib/format.js";
 import { parseBool, parseKeyValueTokens, parseNum, tokenize } from "./lib/parser.js";
 import { loadCustomRegionProfiles, regionFilePath } from "./lib/region-store.js";
 import { loadSession, saveSession, sessionFilePath } from "./lib/session-store.js";
+import { clearAuthToken } from "./lib/token-store.js";
 import {
   createInitialState,
   derivePhase,
@@ -37,6 +38,7 @@ import type {
   AppState,
   CartLine,
   ItemSkuOption,
+  LocationPolicy,
   LocationSource,
   MenuCategory,
   MenuItem,
@@ -60,7 +62,7 @@ const HELP = `CHAGEE CLI (simple mode)
   otp <code> [phone=<phone>] [phoneCode=<dial-code>]  (legacy OTP verify)
   logout
 
-  locate [timeout=60] [open=1]
+  locate [timeout=60] [open=1]  (recommended for highest location accuracy)
   stores [sort=distance|wait|cups|name] [lat=1.35] [lng=103.81]
   watch on|off [interval=10] [sort=distance|wait|cups|name] [quiet=1]
   use <storeNo>
@@ -83,7 +85,7 @@ const HELP = `CHAGEE CLI (simple mode)
   place [open=1] [channelCode=H5] [payType=1]
   order [show|cancel]
   pay [open=1] [channelCode=H5] [payType=1]  (guided)
-  pay [status|open|start]
+  pay [status|await|open|start]
   payment status auto-polls every 5s while pending.
 
   debug help`;
@@ -102,14 +104,14 @@ const SAFE_HELP = `CHAGEE CLI (simple mode)
   otp <code> [phone=<phone>] [phoneCode=<dial-code>]  (legacy OTP verify)
   logout
 
-  locate [timeout=60] [open=1]
+  locate [timeout=60] [open=1]  (recommended for highest location accuracy)
   stores [sort=distance|wait|cups|name] [lat=1.35] [lng=103.81]
   watch on|off [interval=10] [sort=distance|wait|cups|name] [quiet=1]
 
   quote  (requires login + cart context)
   order [show]
   pay [open=1] [channelCode=H5] [payType=1]  (guided; requires cart/order context)
-  pay [status]
+  pay [status|await]
   payment status auto-polls every 5s while pending.
 
   debug help`;
@@ -119,16 +121,41 @@ type CommandSource = "shell" | "panel" | "system";
 
 interface AppOptions {
   yolo?: boolean;
+  locationPolicy?: LocationPolicy;
 }
 
 interface ExecuteOptions {
   source?: CommandSource;
 }
 
+type PaymentStatusSource = "manual" | "auto" | "await";
+type PaymentStatusResolution = "success" | "pending" | "failed" | "unknown" | "api_error" | "not_ready";
+
+interface PaymentStatusOutcome {
+  resolution: PaymentStatusResolution;
+  numericStatuses: number[];
+  textStatuses: string[];
+  apiErrcode?: string;
+  apiErrmsg?: string;
+}
+
 interface BrowserLocation {
   latitude: number;
   longitude: number;
   accuracyMeters?: number;
+}
+
+interface StartupLocationDecision {
+  shouldRefreshWithIp: boolean;
+  shouldRunBrowserLocate: boolean;
+  reason?: string;
+  driftKm?: number;
+}
+
+interface StartupLocationRecommendation {
+  shouldRunBrowserLocate: boolean;
+  reason?: string;
+  driftKm?: number;
 }
 
 type BrowserCaptureStatus =
@@ -155,10 +182,24 @@ interface BrowserTokenCaptureResult {
 }
 
 const LOCATION_SOURCES: readonly LocationSource[] = ["default", "ip", "browser", "manual"];
+const LOCATION_POLICIES: readonly LocationPolicy[] = ["smart", "ip-only", "manual-only"];
 const LOCATION_HEARTBEAT_MS = 60 * 1000;
 const LOCATION_CHANGE_EPSILON = 0.000001;
+const LOCATION_STARTUP_TTL_DEFAULT_OR_IP_MS = 30 * 60 * 1000;
+const LOCATION_STARTUP_TTL_BROWSER_MS = 6 * 60 * 60 * 1000;
+const LOCATION_STARTUP_TTL_MANUAL_MS = 24 * 60 * 60 * 1000;
+const LOCATION_STARTUP_DRIFT_REFRESH_KM = 50;
+const LOCATION_STARTUP_MANUAL_DRIFT_KM = 80;
 const PAYMENT_STATUS_POLL_MS = 5 * 1000;
 const PAYMENT_STATUS_ERROR_LOG_THROTTLE_MS = 30 * 1000;
+const PAYMENT_AWAIT_DEFAULT_TIMEOUT_SEC = 180;
+const PAYMENT_AWAIT_DEFAULT_INTERVAL_SEC = 3;
+const PAYMENT_AWAIT_MIN_TIMEOUT_SEC = 5;
+const PAYMENT_AWAIT_MAX_TIMEOUT_SEC = 1800;
+const PAYMENT_AWAIT_MIN_INTERVAL_SEC = 1;
+const PAYMENT_AWAIT_MAX_INTERVAL_SEC = 30;
+const PAYMENT_AWAIT_PROGRESS_LOG_MS = 10 * 1000;
+const PAYMENT_AWAIT_API_ERROR_LOG_MS = 5 * 1000;
 const ITEM_OPTION_PRINT_LIMIT = 24;
 
 export class App {
@@ -179,6 +220,10 @@ export class App {
   private lastPaymentStatusPollErrorAtMs = 0;
   private itemSkuOptionsCacheByStore: Record<string, Record<string, ItemSkuOption[]>> = {};
   private lastLocationHeartbeatAttemptAtMs = 0;
+  private readonly locationPolicy: LocationPolicy;
+  private startupLocationRecommendation: StartupLocationRecommendation = {
+    shouldRunBrowserLocate: false
+  };
   private readonly yoloMode: boolean;
 
   private readonly client = new ChageeClient(
@@ -200,13 +245,18 @@ export class App {
 
   constructor(options: AppOptions = {}) {
     this.yoloMode = options.yolo === true;
+    this.locationPolicy = normalizeLocationPolicy(options.locationPolicy, "smart");
   }
 
   async init(): Promise<void> {
     const customRegions = await loadCustomRegionProfiles();
     this.regionRegistry = buildRegionRegistry(customRegions);
 
-    const saved = await loadSession();
+    const loaded = await loadSession();
+    for (const warning of loaded.warnings) {
+      console.warn(`Session warning: ${warning}`);
+    }
+    const saved = loaded.state;
     if (saved) {
       this.state = {
         ...this.state,
@@ -241,7 +291,7 @@ export class App {
       this.state.session.locationSource = "default";
     }
 
-    await this.autoLocateFromIpIfNeeded();
+    await this.applyStartupLocationPolicy();
     this.syncMenuCacheForSelectedStore();
     if (this.state.selectedStore?.storeNo && !this.hasMenuCacheForStore(this.state.selectedStore.storeNo)) {
       try {
@@ -492,9 +542,11 @@ export class App {
   private printStatus(): void {
     const phase = derivePhase(this.state);
     const region = this.activeRegion();
+    const locationHint = locationAccuracyHint(this.state.session.locationSource);
     const summary = {
       phase,
       mode: this.state.session.mode,
+      locationPolicy: this.locationPolicy,
       region: {
         code: this.state.session.region,
         name: region.name,
@@ -530,7 +582,8 @@ export class App {
         source: this.state.session.locationSource,
         updatedAt: this.state.session.locationUpdatedAt,
         accuracyMeters: this.state.session.locationAccuracyMeters,
-        storePinned: this.state.session.storePinned
+        storePinned: this.state.session.storePinned,
+        ...(locationHint ? { hint: locationHint } : {})
       },
       cartItems: this.state.cart.length,
       cartVersion: this.state.cartVersion,
@@ -680,7 +733,11 @@ export class App {
         return;
       }
 
+      const previousUserId = this.state.auth?.userId;
       this.applyRegionSwitch(profile);
+      if (previousUserId) {
+        await clearAuthToken(previousUserId);
+      }
       await this.persist();
       console.log(`Region set to ${profile.code} (${profile.name})`);
       console.log("Session reset: auth/store/cart/order/payment cleared.");
@@ -1301,6 +1358,7 @@ export class App {
   }
 
   private async cmdLogout(): Promise<void> {
+    const previousUserId = this.state.auth?.userId;
     this.state.auth = undefined;
     this.state.pendingLoginPhone = undefined;
     this.state.session.storePinned = false;
@@ -1308,6 +1366,9 @@ export class App {
     this.state.order = undefined;
     this.state.payment = undefined;
     this.itemSkuOptionsCacheByStore = {};
+    if (previousUserId) {
+      await clearAuthToken(previousUserId);
+    }
     await this.persist();
     console.log("Logged out");
   }
@@ -2118,28 +2179,38 @@ export class App {
       return;
     }
 
-    console.log("Usage: pay [open=1] [channelCode=H5] [payType=1] | pay [status|open|start]");
+    if (action === "await") {
+      await this.cmdPayAwait(rest.slice(1));
+      return;
+    }
+
+    console.log("Usage: pay [open=1] [channelCode=H5] [payType=1] | pay [status|await|open|start]");
   }
 
-  private async refreshPaymentStatus(source: "manual" | "auto"): Promise<void> {
+  private async refreshPaymentStatus(source: PaymentStatusSource): Promise<PaymentStatusOutcome> {
+    const emptyOutcome: PaymentStatusOutcome = {
+      resolution: "not_ready",
+      numericStatuses: [],
+      textStatuses: []
+    };
     if (!this.state.auth) {
-      if (source === "manual") {
+      if (source !== "auto") {
         console.log("Login required. Run `login` first.");
       }
-      return;
+      return emptyOutcome;
     }
     if (!this.state.selectedStore) {
-      if (source === "manual") {
+      if (source !== "auto") {
         console.log("Select a store first.");
       }
-      return;
+      return emptyOutcome;
     }
     if (!this.state.order?.orderNo) {
-      if (source === "manual") {
+      if (source !== "auto") {
         console.log("No order found in session.");
-        console.log("Run `pay` to create/open payment, then `pay status`.");
+        console.log("Run `pay` to create/open payment, then `pay status` or `pay await`.");
       }
-      return;
+      return emptyOutcome;
     }
 
     const res = await this.client.payResultList({
@@ -2151,12 +2222,19 @@ export class App {
       this.printEnvelope(res);
     }
     if (!isApiOk(res)) {
-      return;
+      return {
+        resolution: "api_error",
+        numericStatuses: [],
+        textStatuses: [],
+        apiErrcode: asString(res.errcode) ?? String(res.errcode ?? ""),
+        apiErrmsg: asString(res.errmsg) ?? String(res.errmsg ?? "")
+      };
     }
 
     const data = envelopeData(res);
-    const statuses = extractPayStatuses(data);
-    if (statuses.includes(2)) {
+    this.applyOrderCancelWindow(data);
+    const evaluated = evaluatePaymentStatus(data);
+    if (evaluated.resolution === "success") {
       const previousOrderStatus = this.state.order?.status;
       const previousPaymentStatus = this.state.payment?.status;
       if (this.state.order) {
@@ -2176,10 +2254,10 @@ export class App {
       if (source === "manual" || changed) {
         console.log(`Payment status: SUCCESS${source === "auto" ? " (auto)" : ""}`);
       }
-      return;
+      return evaluated;
     }
 
-    if (statuses.includes(1) || statuses.includes(0)) {
+    if (evaluated.resolution === "pending") {
       let changed = false;
       if (!this.state.payment) {
         this.state.payment = { status: "pending" };
@@ -2194,12 +2272,151 @@ export class App {
       if (source === "manual") {
         console.log("Payment status: PENDING");
       }
-      return;
+      return evaluated;
+    }
+
+    if (evaluated.resolution === "failed") {
+      let changed = false;
+      if (!this.state.payment) {
+        this.state.payment = { status: "failed" };
+        changed = true;
+      } else if (this.state.payment.status !== "failed") {
+        this.state.payment.status = "failed";
+        changed = true;
+      }
+      if (changed) {
+        await this.persist();
+      }
+      if (source === "manual" || changed) {
+        console.log(`Payment status: FAILED${source === "auto" ? " (auto)" : ""}`);
+      }
+      return evaluated;
     }
 
     if (source === "manual") {
-      console.log(`Payment statuses: [${statuses.join(", ")}]`);
+      const detail = describePaymentStatusSignals(evaluated.numericStatuses, evaluated.textStatuses);
+      if (detail) {
+        console.log(`Payment status: UNKNOWN (${detail})`);
+      } else {
+        console.log("Payment status: UNKNOWN");
+      }
     }
+    return evaluated;
+  }
+
+  private async cmdPayAwait(rest: string[]): Promise<void> {
+    const parsed = parseKeyValueTokens(rest);
+    const timeoutSec = clampInt(
+      parseNum(parsed.opts.timeout, PAYMENT_AWAIT_DEFAULT_TIMEOUT_SEC),
+      PAYMENT_AWAIT_MIN_TIMEOUT_SEC,
+      PAYMENT_AWAIT_MAX_TIMEOUT_SEC
+    );
+    const intervalSec = clampInt(
+      parseNum(parsed.opts.interval, PAYMENT_AWAIT_DEFAULT_INTERVAL_SEC),
+      PAYMENT_AWAIT_MIN_INTERVAL_SEC,
+      PAYMENT_AWAIT_MAX_INTERVAL_SEC
+    );
+    const open = parseBool(parsed.opts.open, false);
+
+    if (!this.state.auth) {
+      console.log("Login required. Run `login` first.");
+      return;
+    }
+    if (!this.state.selectedStore) {
+      console.log("Select a store first.");
+      return;
+    }
+    if (!this.state.order?.orderNo) {
+      console.log("No order found in session.");
+      console.log("Run `pay` to create/open payment, then `pay await`.");
+      return;
+    }
+
+    if (open) {
+      const url = this.state.payment?.payUrl;
+      if (url) {
+        this.openUrl(url);
+      } else {
+        console.log("No payUrl in state, so nothing to open.");
+      }
+    }
+
+    const startedAtMs = Date.now();
+    const deadlineMs = startedAtMs + timeoutSec * 1000;
+    let checks = 0;
+    let lastProgressLogAtMs = 0;
+    let lastApiErrorLogAtMs = 0;
+
+    this.stopPaymentStatusPolling();
+    console.log(
+      `Awaiting payment result for ${this.state.order.orderNo} (timeout=${timeoutSec}s interval=${intervalSec}s)...`
+    );
+
+    try {
+      while (Date.now() <= deadlineMs) {
+        checks += 1;
+        const outcome = await this.refreshPaymentStatus("await");
+        if (outcome.resolution === "success") {
+          const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+          console.log(`Payment confirmed in ${elapsedSec}s after ${checks} check(s).`);
+          return;
+        }
+        if (outcome.resolution === "failed") {
+          const detail = describePaymentStatusSignals(
+            outcome.numericStatuses,
+            outcome.textStatuses
+          );
+          if (detail) {
+            console.log(`Payment status: FAILED (${detail})`);
+          } else {
+            console.log("Payment status: FAILED");
+          }
+          return;
+        }
+        if (outcome.resolution === "not_ready") {
+          return;
+        }
+
+        const now = Date.now();
+        if (outcome.resolution === "api_error") {
+          if (now - lastApiErrorLogAtMs >= PAYMENT_AWAIT_API_ERROR_LOG_MS) {
+            lastApiErrorLogAtMs = now;
+            const code = outcome.apiErrcode ?? "";
+            const msg = outcome.apiErrmsg ?? "";
+            console.log(`Payment status check API error (errcode=${code} errmsg=${msg}). Retrying...`);
+          }
+        } else if (outcome.resolution === "unknown") {
+          const detail = describePaymentStatusSignals(
+            outcome.numericStatuses,
+            outcome.textStatuses
+          );
+          if (detail) {
+            console.log(`Payment status: UNKNOWN (${detail}). Retrying...`);
+          } else {
+            console.log("Payment status: UNKNOWN. Retrying...");
+          }
+        } else if (
+          outcome.resolution === "pending" &&
+          (checks === 1 || now - lastProgressLogAtMs >= PAYMENT_AWAIT_PROGRESS_LOG_MS)
+        ) {
+          lastProgressLogAtMs = now;
+          const elapsedSec = Math.max(0, Math.floor((now - startedAtMs) / 1000));
+          console.log(`Payment status: PENDING (${elapsedSec}s elapsed).`);
+        }
+
+        const remainingMs = deadlineMs - Date.now();
+        if (remainingMs <= 0) {
+          break;
+        }
+        await sleepMs(Math.min(intervalSec * 1000, remainingMs));
+      }
+    } finally {
+      this.reconcilePaymentStatusPolling();
+    }
+
+    console.log(`Timed out after ${timeoutSec}s waiting for payment confirmation.`);
+    await this.refreshPaymentStatus("manual");
+    console.log("If payment just completed, re-run `pay await` or `pay status`.");
   }
 
   private async cmdPayGuided(rest: string[]): Promise<void> {
@@ -2671,16 +2888,110 @@ export class App {
     console.log(`Opened ${url}`);
   }
 
-  private async autoLocateFromIpIfNeeded(): Promise<void> {
-    const source = this.state.session.locationSource;
-    if (source === "manual" || source === "browser") {
+  private async applyStartupLocationPolicy(): Promise<void> {
+    this.startupLocationRecommendation = { shouldRunBrowserLocate: false };
+
+    if (this.locationPolicy === "manual-only") {
       return;
     }
 
     const resolved = await this.resolveLocationFromIp();
-    if (!resolved) {
+    if (this.locationPolicy === "ip-only") {
+      if (resolved) {
+        await this.applyResolvedIpLocationAtStartup(resolved, "policy");
+      }
       return;
     }
+
+    const decision = this.evaluateSmartStartupLocationDecision(resolved);
+    const recommendation: StartupLocationRecommendation = {
+      shouldRunBrowserLocate: decision.shouldRunBrowserLocate
+    };
+    if (decision.reason !== undefined) {
+      recommendation.reason = decision.reason;
+    }
+    if (decision.driftKm !== undefined) {
+      recommendation.driftKm = decision.driftKm;
+    }
+    this.startupLocationRecommendation = recommendation;
+
+    if (!decision.shouldRefreshWithIp || !resolved) {
+      return;
+    }
+
+    await this.applyResolvedIpLocationAtStartup(resolved, decision.reason ?? "startup");
+  }
+
+  private evaluateSmartStartupLocationDecision(
+    resolved: BrowserLocation | undefined
+  ): StartupLocationDecision {
+    const source = this.state.session.locationSource;
+    const updatedAtMs = parseTimestampMs(this.state.session.locationUpdatedAt);
+    const now = Date.now();
+    const ageMs = updatedAtMs !== undefined ? Math.max(0, now - updatedAtMs) : undefined;
+    const driftKm =
+      resolved &&
+      Number.isFinite(this.state.session.latitude) &&
+      Number.isFinite(this.state.session.longitude)
+        ? haversineDistanceKm(
+            this.state.session.latitude,
+            this.state.session.longitude,
+            resolved.latitude,
+            resolved.longitude
+          )
+        : undefined;
+
+    const isDefaultOrIp = source === "default" || source === "ip";
+    let reason: string | undefined;
+
+    if (updatedAtMs === undefined) {
+      if (isDefaultOrIp || source === "browser") {
+        reason = "missing";
+      }
+    } else if (isDefaultOrIp && ageMs !== undefined && ageMs > LOCATION_STARTUP_TTL_DEFAULT_OR_IP_MS) {
+      reason = "ttl";
+    } else if (source === "browser" && ageMs !== undefined && ageMs > LOCATION_STARTUP_TTL_BROWSER_MS) {
+      reason = "ttl";
+    } else if (
+      source === "manual" &&
+      ageMs !== undefined &&
+      ageMs > LOCATION_STARTUP_TTL_MANUAL_MS &&
+      driftKm !== undefined &&
+      driftKm > LOCATION_STARTUP_MANUAL_DRIFT_KM
+    ) {
+      reason = "ttl+drift";
+    }
+
+    if (!reason && driftKm !== undefined && driftKm > LOCATION_STARTUP_DRIFT_REFRESH_KM) {
+      reason = "drift";
+    }
+
+    const decision: StartupLocationDecision = {
+      shouldRefreshWithIp: Boolean(reason && resolved),
+      shouldRunBrowserLocate: Boolean(reason)
+    };
+    if (reason !== undefined) {
+      decision.reason = reason;
+    }
+    if (driftKm !== undefined) {
+      decision.driftKm = driftKm;
+    }
+    return decision;
+  }
+
+  private async applyResolvedIpLocationAtStartup(
+    resolved: BrowserLocation,
+    reason: string
+  ): Promise<void> {
+    const previous = {
+      latitude: this.state.session.latitude,
+      longitude: this.state.session.longitude,
+      source: this.state.session.locationSource
+    };
+
+    const now = Date.now();
+    const checkedAt = new Date(now).toISOString();
+    this.lastLocationHeartbeatAttemptAtMs = now;
 
     const latitudeChanged =
       Math.abs(this.state.session.latitude - resolved.latitude) > LOCATION_CHANGE_EPSILON;
@@ -2688,13 +2999,16 @@ export class App {
       Math.abs(this.state.session.longitude - resolved.longitude) > LOCATION_CHANGE_EPSILON;
     const sourceChanged = this.state.session.locationSource !== "ip";
     if (!latitudeChanged && !longitudeChanged && !sourceChanged) {
+      this.state.session.locationUpdatedAt = checkedAt;
+      this.state.session.locationAccuracyMeters = resolved.accuracyMeters;
+      await this.persist();
       return;
     }
 
     this.state.session.latitude = resolved.latitude;
     this.state.session.longitude = resolved.longitude;
     this.state.session.locationSource = "ip";
-    this.state.session.locationUpdatedAt = new Date().toISOString();
+    this.state.session.locationUpdatedAt = checkedAt;
     this.state.session.locationAccuracyMeters = resolved.accuracyMeters;
     this.state.session.storePinned = false;
     if (this.state.storesCache.length > 0 || this.state.selectedStore) {
@@ -2705,6 +3019,10 @@ export class App {
       }
     }
     await this.persist();
+
+    console.log(
+      `Location refresh: method=ip reason=${reason} old=${previous.latitude.toFixed(6)},${previous.longitude.toFixed(6)}(${previous.source}) new=${resolved.latitude.toFixed(6)},${resolved.longitude.toFixed(6)}(ip)`
+    );
   }
 
   private async maybeRefreshLocationHeartbeat(silent: boolean): Promise<void> {
@@ -3022,6 +3340,10 @@ export class App {
     return this.dispatch(raw, options.source ?? "shell");
   }
 
+  startupLocationRecommendationSnapshot(): StartupLocationRecommendation {
+    return { ...this.startupLocationRecommendation };
+  }
+
   stateSnapshot(): AppState {
     return structuredClone(this.state) as AppState;
   }
@@ -3073,7 +3395,7 @@ export class App {
     }
 
     if (cmd === "pay") {
-      if (sub === "status") {
+      if (sub === "status" || sub === "await") {
         return false;
       }
       if (sub === "start" || sub === "open") {
@@ -4509,21 +4831,217 @@ function extractPayUrl(data: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function extractPayStatuses(data: unknown): number[] {
-  if (!Array.isArray(data)) {
-    return [];
+const PAYMENT_STATUS_NUMERIC_KEYS = new Set([
+  "status",
+  "paystatus",
+  "paymentstatus",
+  "resultstatus",
+  "tradestatus",
+  "payresultstatus",
+  "orderstatus"
+]);
+
+const PAYMENT_STATUS_TEXT_KEYS = new Set([
+  "statusdesc",
+  "statustext",
+  "statusname",
+  "paystatusdesc",
+  "paymentstatusdesc",
+  "resultstatusdesc",
+  "tradestatusdesc",
+  "paystatusname",
+  "state"
+]);
+
+const PAYMENT_SUCCESS_NUMERIC = new Set([2]);
+const PAYMENT_PENDING_NUMERIC = new Set([0, 1]);
+const PAYMENT_FAILED_NUMERIC = new Set([3, 4, 5, 6, 7, 8, 9, -1]);
+
+const PAYMENT_SUCCESS_TEXT_TOKENS = ["success", "succeeded", "paid", "completed"] as const;
+const PAYMENT_PENDING_TEXT_TOKENS = ["pending", "processing", "paying", "awaiting", "created"] as const;
+const PAYMENT_FAILED_TEXT_TOKENS = [
+  "fail",
+  "failed",
+  "cancel",
+  "canceled",
+  "cancelled",
+  "closed",
+  "expired",
+  "timeout",
+  "timed_out",
+  "error",
+  "rejected",
+  "declined"
+] as const;
+
+function evaluatePaymentStatus(data: unknown): PaymentStatusOutcome {
+  const signals = extractPaymentStatusSignals(data);
+  const normalizedTexts = signals.textStatuses
+    .map(normalizePaymentStatusText)
+    .filter((value) => value.length > 0);
+
+  const hasSuccessSignal =
+    signals.numericStatuses.some((value) => PAYMENT_SUCCESS_NUMERIC.has(value)) ||
+    hasAnyStatusToken(normalizedTexts, PAYMENT_SUCCESS_TEXT_TOKENS);
+  if (hasSuccessSignal) {
+    return {
+      resolution: "success",
+      numericStatuses: signals.numericStatuses,
+      textStatuses: signals.textStatuses
+    };
   }
-  const statuses: number[] = [];
-  for (const item of data) {
-    if (!item || typeof item !== "object") {
+
+  const hasPendingSignal =
+    signals.numericStatuses.some((value) => PAYMENT_PENDING_NUMERIC.has(value)) ||
+    hasAnyStatusToken(normalizedTexts, PAYMENT_PENDING_TEXT_TOKENS);
+  if (hasPendingSignal) {
+    return {
+      resolution: "pending",
+      numericStatuses: signals.numericStatuses,
+      textStatuses: signals.textStatuses
+    };
+  }
+
+  const hasFailedSignal =
+    signals.numericStatuses.some((value) => PAYMENT_FAILED_NUMERIC.has(value)) ||
+    hasAnyStatusToken(normalizedTexts, PAYMENT_FAILED_TEXT_TOKENS);
+  if (hasFailedSignal) {
+    return {
+      resolution: "failed",
+      numericStatuses: signals.numericStatuses,
+      textStatuses: signals.textStatuses
+    };
+  }
+
+  return {
+    resolution: "unknown",
+    numericStatuses: signals.numericStatuses,
+    textStatuses: signals.textStatuses
+  };
+}
+
+function extractPaymentStatusSignals(data: unknown): { numericStatuses: number[]; textStatuses: string[] } {
+  const numericStatuses: number[] = [];
+  const textStatuses: string[] = [];
+  const stack: unknown[] = [data];
+  const seen = new Set<unknown>();
+  let visitedObjects = 0;
+
+  while (stack.length > 0 && visitedObjects < 2000) {
+    const current = stack.pop();
+    if (!current) {
       continue;
     }
-    const status = toNum((item as Record<string, unknown>).status);
-    if (status !== undefined) {
-      statuses.push(status);
+    if (Array.isArray(current)) {
+      for (let i = current.length - 1; i >= 0; i -= 1) {
+        stack.push(current[i]);
+      }
+      continue;
+    }
+    if (typeof current !== "object") {
+      continue;
+    }
+    if (seen.has(current)) {
+      continue;
+    }
+    seen.add(current);
+    visitedObjects += 1;
+
+    const obj = current as Record<string, unknown>;
+    for (const [rawKey, rawValue] of Object.entries(obj)) {
+      const key = normalizeKey(rawKey);
+      if (PAYMENT_STATUS_NUMERIC_KEYS.has(key)) {
+        const numeric = toNum(rawValue);
+        if (numeric !== undefined) {
+          numericStatuses.push(numeric);
+        } else {
+          const text = asString(rawValue);
+          if (text) {
+            textStatuses.push(text);
+          }
+        }
+      } else if (PAYMENT_STATUS_TEXT_KEYS.has(key)) {
+        const text = asString(rawValue);
+        if (text) {
+          textStatuses.push(text);
+        }
+        const numeric = toNum(rawValue);
+        if (numeric !== undefined) {
+          numericStatuses.push(numeric);
+        }
+      }
+
+      if (rawValue && typeof rawValue === "object") {
+        stack.push(rawValue);
+      }
     }
   }
-  return statuses;
+
+  return {
+    numericStatuses: uniqueNumericStatuses(numericStatuses),
+    textStatuses: uniqueTextStatuses(textStatuses)
+  };
+}
+
+function describePaymentStatusSignals(numericStatuses: number[], textStatuses: string[]): string {
+  const parts: string[] = [];
+  if (numericStatuses.length > 0) {
+    parts.push(`codes=[${numericStatuses.join(", ")}]`);
+  }
+  if (textStatuses.length > 0) {
+    const limited = textStatuses.slice(0, 4);
+    parts.push(`text=[${limited.join(", ")}${textStatuses.length > limited.length ? ", ..." : ""}]`);
+  }
+  return parts.join(" ");
+}
+
+function uniqueNumericStatuses(values: number[]): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const value of values) {
+    if (!Number.isFinite(value) || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function uniqueTextStatuses(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0 || seen.has(trimmed)) {
+      continue;
+    }
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function normalizePaymentStatusText(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function hasAnyStatusToken(values: string[], tokens: readonly string[]): boolean {
+  return values.some((value) => tokens.some((token) => statusTokenMatches(value, token)));
+}
+
+function statusTokenMatches(value: string, token: string): boolean {
+  if (value === token) {
+    return true;
+  }
+  if (value.startsWith(`${token}_`) || value.endsWith(`_${token}`)) {
+    return true;
+  }
+  return value.includes(`_${token}_`);
 }
 
 interface PrimitiveEntry {
@@ -4716,6 +5234,17 @@ function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function parseAbsoluteTime(value: unknown): number | undefined {
   const numeric = toNum(value);
   if (numeric !== undefined && Number.isFinite(numeric)) {
@@ -4750,6 +5279,51 @@ function parseDurationSeconds(value: unknown): number | undefined {
     return Math.floor(numeric / 1000);
   }
   return Math.floor(numeric);
+}
+
+function parseTimestampMs(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function haversineDistanceKm(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number
+): number {
+  const toRad = (deg: number): number => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return 6371 * c;
+}
+
+function isLocationPolicy(value: unknown): value is LocationPolicy {
+  return typeof value === "string" && LOCATION_POLICIES.includes(value as LocationPolicy);
+}
+
+function normalizeLocationPolicy(
+  value: unknown,
+  fallback: LocationPolicy = "smart"
+): LocationPolicy {
+  return isLocationPolicy(value) ? value : fallback;
+}
+
+function locationAccuracyHint(source: LocationSource): string | undefined {
+  if (source === "default" || source === "ip") {
+    return "IP-based location is approximate. Run `locate` for higher accuracy.";
+  }
+  return undefined;
 }
 
 function isLocationSource(value: unknown): value is LocationSource {
