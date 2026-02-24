@@ -115,6 +115,8 @@ Supported options:
 - `-v, --version`
 - `--tui`
 - `--yolo` (enables shell ordering commands)
+- `--location-policy <smart|ip-only|manual-only>`
+- `--no-auto-locate` (skip startup browser geolocation in TUI)
 - `--json`
 - `--mode <dry-run|live>`
 - `--region <CODE>`
@@ -125,6 +127,8 @@ Supported options:
 - `-h, --help`
 - `-v, --version`
 - `--yolo`
+- `--location-policy <smart|ip-only|manual-only>`
+- `--no-auto-locate`
 
 #### Install as Global Command
 
@@ -221,9 +225,12 @@ Console notes:
 - Panel interactions still allow ordering flow in SAFE mode.
 - Mouse click capture is enabled by default for pane navigation.
 - Use `/mouse off` if you want native terminal text selection/copy behavior.
+- Startup location policy defaults to `smart`:
+  `default/ip` stale after ~30m, `browser` stale after ~6h, `manual` stale after ~24h with large drift; large IP drift (>50km) also marks stale.
+- When stale and auto-locate is enabled, browser geolocation auto-runs (same as `/locate timeout=45 open=1`), unless started with `--no-auto-locate` or `--location-policy manual-only`.
 - Store capacity auto-refresh starts on launch (`/watch on interval=10 sort=distance quiet=1`).
 - Payment status auto-polling runs every 5s while an order payment is pending.
-- Location is validated on startup via IP geolocation for `default/ip` sessions. Browser/manual coordinates are preserved.
+- Startup also performs an IP probe and may refresh to IP as fallback when stale/drift is detected.
 - Distance heartbeat: backend re-checks IP geolocation every ~60s during store refresh for non-manual/non-browser sessions.
 - For higher precision, run `/locate` (browser geolocation) or set manually with:
   `stores lat=<your-lat> lng=<your-lng>`
@@ -317,7 +324,7 @@ add <skuId> qty=1 spuId=<spuId> name="Jasmine Green Milk Tea"
 cart
 
 pay
-pay status
+pay await
 order
 ```
 
@@ -432,8 +439,9 @@ Simple flow commands:
 - `place [open=1] [channelCode=H5] [payType=1]`
 - `order [show|cancel [force=1]]`
 - `pay [open=1] [channelCode=H5] [payType=1]` (guided)
-- `pay [status|open|start]`
-- `pay status` remains available for on-demand checks; polling updates status automatically while pending.
+- `pay [status|await|open|start]`
+- `pay await [timeout=180] [interval=3] [open=0]` waits for terminal payment status.
+- `pay status` remains available for on-demand checks; background polling also updates status automatically while pending.
 
 Cancel window notes:
 

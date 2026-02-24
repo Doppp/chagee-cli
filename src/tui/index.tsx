@@ -10,6 +10,8 @@ import type {
   AppState,
   CartLine,
   ItemSkuOption,
+  LocationPolicy,
+  LocationSource,
   MenuCategory,
   MenuItem,
   StoreState
@@ -80,6 +82,7 @@ interface MouseContext {
   terminalCols: number;
   focusPane: FocusPane;
   storesLen: number;
+  storeFooterRows: number;
   menuLen: number;
   menuVisibleItemIndices: Array<number | undefined>;
   menuVariantFooterRows: number;
@@ -126,6 +129,7 @@ const CART_FOOTER_ROWS = 2;
 const CART_DETAIL_ROWS = 7;
 const STORE_PANE_RATIO = 0.38;
 const MENU_PANE_RATIO = 0.34;
+const AUTO_LOCATE_STARTUP_TIMEOUT_SEC = 45;
 const ALL_SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "help", description: "show command help" },
   { command: "status", description: "show current session status" },
@@ -161,6 +165,7 @@ const ALL_SLASH_COMMANDS: SlashCommandHint[] = [
   { command: "order cancel", description: "cancel latest order (if allowed)" },
   { command: "pay", description: "guided payment (create/open payment link)" },
   { command: "pay status", description: "check payment status for latest order" },
+  { command: "pay await", description: "poll payment status until success/failure/timeout" },
   { command: "region list", description: "show configured region profiles" },
   { command: "region set <code>", description: "switch region and reset session", insert: "region set " },
   { command: "exit", description: "quit TUI session" }
@@ -182,14 +187,28 @@ const SHELL_ORDERING_ROOTS = new Set([
   "live"
 ]);
 
+function startupLocationAccuracyTip(source: LocationSource | undefined): string | undefined {
+  if (source === "default" || source === "ip") {
+    return "Location is currently IP-based and approximate. Run /locate for higher accuracy.";
+  }
+  return undefined;
+}
+
 interface RunTuiOptions {
   yolo?: boolean;
+  autoLocate?: boolean;
+  locationPolicy?: LocationPolicy;
 }
 
 export async function runTui(options: RunTuiOptions = {}): Promise<void> {
   const yolo = options.yolo === true;
+  const autoLocate = options.autoLocate !== false;
+  const locationPolicy = options.locationPolicy ?? "smart";
   const restoreTerminal = enterInteractiveSession(process.stdout);
-  const instance = render(<TuiRoot yolo={yolo} />, { exitOnCtrlC: false });
+  const instance = render(
+    <TuiRoot yolo={yolo} autoLocate={autoLocate} locationPolicy={locationPolicy} />,
+    { exitOnCtrlC: false }
+  );
   const teardown = (): void => {
     instance.unmount();
   };
@@ -209,13 +228,21 @@ export async function runTui(options: RunTuiOptions = {}): Promise<void> {
 
 interface TuiRootProps {
   yolo: boolean;
+  autoLocate: boolean;
+  locationPolicy: LocationPolicy;
 }
 
 function TuiRoot(props: TuiRootProps): React.JSX.Element {
-  const appRef = useRef(new App({ yolo: props.yolo }));
+  const appRef = useRef(new App({ yolo: props.yolo, locationPolicy: props.locationPolicy }));
   const queueRef = useRef(Promise.resolve());
   const stoppingRef = useRef(false);
   const autoWatchStartedRef = useRef(false);
+  const autoLocateStartedRef = useRef(false);
+  const startupLocateRecommendationRef = useRef<{
+    shouldRunBrowserLocate: boolean;
+    reason?: string;
+    driftKm?: number;
+  }>({ shouldRunBrowserLocate: false });
   const lastMouseClickRef = useRef<LastMouseClick | undefined>(undefined);
 
   const prevOrderNoRef = useRef<string | undefined>(undefined);
@@ -295,6 +322,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     terminalCols,
     focusPane,
     storesLen: stores.length,
+    storeFooterRows: 0,
     menuLen: menuRows.length,
     menuVisibleItemIndices: [],
     menuVariantFooterRows: 0,
@@ -556,7 +584,9 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       if (cancelled) {
         return;
       }
-      refreshSnapshot();
+      const snapshot = appRef.current.stateSnapshot();
+      startupLocateRecommendationRef.current = appRef.current.startupLocationRecommendationSnapshot();
+      setAppState(snapshot);
       setReady(true);
       pushLog("Ready. Type /help.");
       if (!props.yolo) {
@@ -564,12 +594,56 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
           "SAFE shell mode: most ordering slash commands are disabled (but /quote is allowed). Use panels or restart with --yolo."
         );
       }
+      const tip = startupLocationAccuracyTip(snapshot.session.locationSource);
+      if (tip) {
+        pushLog(tip);
+      }
       pushLog("Keyboard-only panel navigation enabled. Mouse is reserved for native text selection/copy.");
     })();
     return () => {
       cancelled = true;
     };
-  }, [props.yolo, pushLog, refreshSnapshot]);
+  }, [props.yolo, pushLog]);
+
+  useEffect(() => {
+    if (!ready || !props.autoLocate || autoLocateStartedRef.current) {
+      return;
+    }
+    if (props.locationPolicy === "manual-only") {
+      return;
+    }
+    const recommendation = startupLocateRecommendationRef.current;
+    if (!recommendation.shouldRunBrowserLocate) {
+      return;
+    }
+
+    autoLocateStartedRef.current = true;
+    enqueue(async () => {
+      setBusy(true);
+      try {
+        const driftText =
+          recommendation.driftKm !== undefined
+            ? ` drift=${recommendation.driftKm.toFixed(1)}km`
+            : "";
+        pushLog(
+          `Startup geolocation: requesting browser location (reason=${recommendation.reason ?? "startup"}${driftText}).`
+        );
+        await appRef.current.execute(
+          `/locate timeout=${AUTO_LOCATE_STARTUP_TIMEOUT_SEC} open=1`,
+          { source: "system" }
+        );
+        const snapshot = appRef.current.stateSnapshot();
+        setAppState(snapshot);
+        if (snapshot.session.locationSource === "browser") {
+          pushLog("Startup geolocation captured from browser.");
+        } else {
+          pushLog(`Startup geolocation fallback source=${snapshot.session.locationSource}.`);
+        }
+      } finally {
+        setBusy(false);
+      }
+    });
+  }, [enqueue, props.autoLocate, props.locationPolicy, pushLog, ready]);
 
   useEffect(() => {
     if (!ready || autoWatchStartedRef.current) {
@@ -731,6 +805,10 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     const activeMenuLen = menuVariantPicker
       ? getMenuVariantStageChoices(menuVariantPicker).length
       : menuRows.length;
+    const storeFooterRows = buildStoreLocationFooterLines(
+      appState?.session.locationSource,
+      storePaneTextWidth
+    ).length;
     const menuVariantFooterRows = menuVariantPicker
       ? buildMenuVariantFooterLines(menuVariantPicker, menuPaneTextWidth).length + 1
       : 0;
@@ -742,6 +820,7 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
       terminalCols,
       focusPane,
       storesLen: stores.length,
+      storeFooterRows,
       menuLen: activeMenuLen,
       menuVisibleItemIndices: menuVariantPicker ? [] : menuPaneView.visibleItemIndices,
       menuVariantFooterRows,
@@ -761,8 +840,10 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     menuRows.length,
     menuVariantPicker,
     menuPaneView,
+    appState?.session.locationSource,
     cartPaneTextWidth,
     menuPaneTextWidth,
+    storePaneTextWidth,
     storeIndex,
     stores.length,
     terminalCols
@@ -1077,7 +1158,8 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
     focusPane === "stores",
     storePaneTextWidth,
     Math.max(1, layout.paneHeight - 2),
-    appState?.selectedStore?.storeNo
+    appState?.selectedStore?.storeNo,
+    appState?.session.locationSource
   );
   const menuPaneLines = menuVariantPicker
     ? buildMenuVariantPaneLines(
@@ -1379,8 +1461,11 @@ function buildStorePaneLines(
   focused: boolean,
   width: number,
   maxLines: number,
-  selectedStoreNo?: string
+  selectedStoreNo?: string,
+  locationSource?: LocationSource
 ): string[] {
+  const footerBlock = buildStoreLocationFooterLines(locationSource, width);
+  const bodyCapacity = Math.max(0, maxLines - footerBlock.length);
   const noWidth = Math.max(
     5,
     "ID".length,
@@ -1390,7 +1475,7 @@ function buildStorePaneLines(
   const cupsWidth = 4;
   const waitWidth = 4;
   const nameWidth = Math.max(8, width - (noWidth + distWidth + cupsWidth + waitWidth + 7));
-  const visibleRows = Math.max(0, maxLines - 3);
+  const visibleRows = Math.max(0, bodyCapacity - 3);
   const start = windowStart(storeIndex, stores.length, visibleRows);
   const end = Math.min(stores.length, start + visibleRows);
   const divider = "-".repeat(Math.max(1, width - 2));
@@ -1434,7 +1519,21 @@ function buildStorePaneLines(
       lines[lines.length - 1] = `↓${last.slice(1)}`;
     }
   }
+  if (footerBlock.length > 0) {
+    return [...lines, LINE_FOOTER_SPLIT, ...footerBlock];
+  }
   return lines;
+}
+
+function buildStoreLocationFooterLines(
+  source: LocationSource | undefined,
+  width: number
+): string[] {
+  void source;
+  return wrapPaneLine(
+    `${LINE_SELECTED}  Tip: Use /locate to ensure accurate location data.`,
+    width
+  );
 }
 
 function buildMenuPaneLines(
@@ -2126,14 +2225,29 @@ function buildMenuVariantFooterLines(picker: MenuVariantPickerState, width: numb
 }
 
 function wrapPaneLine(line: string, width: number): string[] {
-  const safeWidth = Math.max(8, width);
-  if (line.length <= safeWidth) {
-    return [line];
+  let stylePrefix = "";
+  let content = line;
+  while (content.startsWith(LINE_ACTIVE) || content.startsWith(LINE_SELECTED)) {
+    if (content.startsWith(LINE_ACTIVE)) {
+      stylePrefix += LINE_ACTIVE;
+      content = content.slice(1);
+      continue;
+    }
+    if (content.startsWith(LINE_SELECTED)) {
+      stylePrefix += LINE_SELECTED;
+      content = content.slice(1);
+      continue;
+    }
   }
-  const indent = line.match(/^\s*/)?.[0] ?? "";
+
+  const safeWidth = Math.max(8, width);
+  if (content.length <= safeWidth) {
+    return [`${stylePrefix}${content}`];
+  }
+  const indent = content.match(/^\s*/)?.[0] ?? "";
   const continuationPrefix = indent.length > 0 ? indent : "  ";
   const out: string[] = [];
-  let remaining = line;
+  let remaining = content;
 
   while (remaining.length > safeWidth) {
     let breakAt = remaining.lastIndexOf(" ", safeWidth);
@@ -2146,7 +2260,10 @@ function wrapPaneLine(line: string, width: number): string[] {
   if (remaining.length > 0) {
     out.push(remaining);
   }
-  return out.length > 0 ? out : [""];
+  if (out.length === 0) {
+    return [`${stylePrefix}`];
+  }
+  return out.map((entry) => `${stylePrefix}${entry}`);
 }
 
 function buildAddCommandForVariant(item: MenuItem, option: ItemSkuOption, qty: number): string {
@@ -2217,6 +2334,7 @@ function handleMouseEvent(
     layout,
     terminalCols,
     storesLen,
+    storeFooterRows,
     menuLen,
     menuVisibleItemIndices,
     menuVariantFooterRows,
@@ -2243,7 +2361,7 @@ function handleMouseEvent(
   if (event.y >= layout.paneStart && event.y <= layout.paneEnd) {
     if (event.x <= boundaries.firstEnd) {
       setFocusPane("stores");
-      const visibleRows = Math.max(0, paneBodyLines - 3);
+      const visibleRows = Math.max(0, paneBodyLines - (3 + storeFooterRows));
       const idx = resolveClickedIndex(
         event.y,
         dataStartY,

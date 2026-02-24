@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 
 import { App, runCliRepl } from "./index.js";
+import type { LocationPolicy } from "./types.js";
 
 interface CliOptions {
   help: boolean;
@@ -10,6 +11,8 @@ interface CliOptions {
   json: boolean;
   tui: boolean;
   yolo: boolean;
+  autoLocate: boolean;
+  locationPolicy: LocationPolicy;
   mode?: string;
   region?: string;
   commands: string[];
@@ -30,6 +33,8 @@ Options
   -v, --version              Show version
   --tui                      Start TUI mode
   --yolo                     Enable shell ordering commands (unsafe)
+  --location-policy <MODE>   Startup location policy: smart|ip-only|manual-only
+  --no-auto-locate           Disable startup browser geolocation in TUI
   --json                     Enable JSON output before running commands
   --mode <dry-run|live>      Set mode before running commands
   --region <CODE>            Set region before running commands
@@ -51,6 +56,8 @@ function parseArgs(argv: string[]): CliOptions {
     json: false,
     tui: false,
     yolo: false,
+    autoLocate: true,
+    locationPolicy: "smart",
     commands: [],
     errors: []
   };
@@ -89,6 +96,39 @@ function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === "--yolo") {
       options.yolo = true;
+      continue;
+    }
+    if (arg.startsWith("--location-policy=")) {
+      const parsed = parseLocationPolicy(arg.slice("--location-policy=".length));
+      if (!parsed) {
+        options.errors.push(
+          `Invalid --location-policy value: ${arg.slice("--location-policy=".length)} (expected smart|ip-only|manual-only)`
+        );
+      } else {
+        options.locationPolicy = parsed;
+      }
+      continue;
+    }
+    if (arg === "--location-policy") {
+      const val = argv[i + 1];
+      if (!val) {
+        options.errors.push("--location-policy requires a value");
+      } else {
+        const parsed = parseLocationPolicy(val);
+        if (!parsed) {
+          options.errors.push(
+            `Invalid --location-policy value: ${val} (expected smart|ip-only|manual-only)`
+          );
+        } else {
+          options.locationPolicy = parsed;
+          i += 1;
+        }
+      }
+      continue;
+    }
+    if (arg === "--no-auto-locate") {
+      options.autoLocate = false;
+      options.locationPolicy = "manual-only";
       continue;
     }
 
@@ -159,6 +199,18 @@ function versionString(): string {
   }
 }
 
+function parseLocationPolicy(raw: string | undefined): LocationPolicy | undefined {
+  const normalized = raw?.trim().toLowerCase();
+  if (
+    normalized === "smart" ||
+    normalized === "ip-only" ||
+    normalized === "manual-only"
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
 async function runWithOptions(options: CliOptions): Promise<void> {
   const hasBootstrapCommands = Boolean(options.region || options.mode || options.json);
   const hasOneShotCommands = options.commands.length > 0;
@@ -166,7 +218,7 @@ async function runWithOptions(options: CliOptions): Promise<void> {
 
   if (options.tui) {
     if (hasBootstrapCommands) {
-      const bootstrap = new App({ yolo: options.yolo });
+      const bootstrap = new App({ yolo: options.yolo, locationPolicy: options.locationPolicy });
       await bootstrap.init();
       if (options.region) {
         await bootstrap.execute(`region set ${options.region}`);
@@ -180,11 +232,15 @@ async function runWithOptions(options: CliOptions): Promise<void> {
       await bootstrap.shutdown();
     }
     const mod = await import("./tui/index.js");
-    await mod.runTui({ yolo: options.yolo });
+    await mod.runTui({
+      yolo: options.yolo,
+      autoLocate: options.autoLocate,
+      locationPolicy: options.locationPolicy
+    });
     return;
   }
 
-  const app = new App({ yolo: options.yolo });
+  const app = new App({ yolo: options.yolo, locationPolicy: options.locationPolicy });
   await app.init();
 
   if (options.region) {
@@ -212,12 +268,16 @@ async function runWithOptions(options: CliOptions): Promise<void> {
 
   if (interactiveTty) {
     const mod = await import("./tui/index.js");
-    await mod.runTui({ yolo: options.yolo });
+    await mod.runTui({
+      yolo: options.yolo,
+      autoLocate: options.autoLocate,
+      locationPolicy: options.locationPolicy
+    });
     return;
   }
 
   if (!hasBootstrapCommands) {
-    await runCliRepl({ yolo: options.yolo });
+    await runCliRepl({ yolo: options.yolo, locationPolicy: options.locationPolicy });
   }
 }
 

@@ -1,5 +1,6 @@
 export type SessionMode = "dry-run" | "live";
 export type LocationSource = "default" | "ip" | "browser" | "manual";
+export type LocationPolicy = "smart" | "ip-only" | "manual-only";
 
 export type AppPhase =
   | "UNAUTH"
