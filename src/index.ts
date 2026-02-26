@@ -1882,33 +1882,44 @@ export class App {
     const res = await this.client.orderPrice(payload);
     this.printEnvelope(res);
 
-    if (isApiOk(res)) {
-      const data = envelopeData<Record<string, unknown>>(res) ?? {};
-      const quoteRespVO =
-        (data.priceQuoteRespVO as Record<string, unknown> | undefined) ?? undefined;
-      const totalCandidates = [
-        quoteRespVO?.payAmount,
-        quoteRespVO?.amount,
-        data.payAmount,
-        data.totalAmount
-      ];
-      let total: string | undefined;
-      for (const c of totalCandidates) {
-        if (typeof c === "string" || typeof c === "number") {
-          total = String(c);
-          break;
-        }
+    if (!isApiOk(res)) {
+      if (this.state.quote || this.state.pendingCreatePayload) {
+        this.state.quote = undefined;
+        this.state.pendingCreatePayload = undefined;
+        await this.persist();
       }
-
-      this.state.quote = {
-        at: new Date().toISOString(),
-        total,
-        priceQuoteRespVO: quoteRespVO,
-        raw: data
-      };
-      await this.persist();
-      console.log(`Quoted total: ${total ?? "(unknown)"}`);
+      console.log("Quote failed; cleared cached quote.");
+      return;
     }
+
+    const data = envelopeData<Record<string, unknown>>(res) ?? {};
+    const quoteRespVO =
+      (data.priceQuoteRespVO as Record<string, unknown> | undefined) ?? undefined;
+    const totalCandidates = [
+      quoteRespVO?.payAmount,
+      quoteRespVO?.amount,
+      data.payAmount,
+      data.totalAmount
+    ];
+    let total: string | undefined;
+    for (const c of totalCandidates) {
+      if (typeof c === "string" || typeof c === "number") {
+        total = String(c);
+        break;
+      }
+    }
+
+    this.state.quote = {
+      at: new Date().toISOString(),
+      total,
+      priceQuoteRespVO: quoteRespVO,
+      raw: data
+    };
+    if (this.state.pendingCreatePayload) {
+      this.state.pendingCreatePayload = undefined;
+    }
+    await this.persist();
+    console.log(`Quoted total: ${total ?? "(unknown)"}`);
   }
 
   private async cmdPlace(rest: string[]): Promise<void> {
