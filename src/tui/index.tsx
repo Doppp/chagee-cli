@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Box, Text, render, useApp, useInput, useStdin, useStdout } from "ink";
 
 import { App } from "../index.js";
+import { formatStoreDisplayName } from "../lib/store-display.js";
 import { derivePhase } from "../lib/state.js";
 import type {
   AppPhase,
@@ -1200,7 +1201,11 @@ function TuiRoot(props: TuiRootProps): React.JSX.Element {
           {formatCoord(appState?.session.latitude)},{formatCoord(appState?.session.longitude)}
         </Text>
         <Text color="magentaBright">
-          Store:{truncate(appState?.selectedStore?.storeName ?? "-", 30)}
+          Store:
+          {truncate(
+            appState?.selectedStore ? formatStoreDisplayName(appState.selectedStore) : "-",
+            30
+          )}
         </Text>
       </Box>
       <Text color="gray">
@@ -1502,7 +1507,7 @@ function buildStorePaneLines(
     const cups = store.waitingCups !== undefined ? String(store.waitingCups) : "-";
     const wait = store.waitingTime !== undefined ? `${store.waitingTime}m` : "-";
     const dist = formatDistanceKm(store.distanceMeters);
-    const name = fit(truncate(store.storeName, nameWidth), nameWidth);
+    const name = fit(truncate(formatStoreDisplayName(store), nameWidth), nameWidth);
     const flags = `${isActive ? LINE_ACTIVE : ""}${isSelected ? LINE_SELECTED : ""}`;
     lines.push(
       `${flags}  ${fit(store.storeNo, noWidth)} ${fit(dist, distWidth)} ${fit(cups, cupsWidth)} ${fit(

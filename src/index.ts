@@ -28,6 +28,7 @@ import {
   evaluateSmartStartupLocationDecision,
   normalizeLocationPolicy
 } from "./lib/location-policy.js";
+import { formatStoreDisplayName } from "./lib/store-display.js";
 import type {
   StartupLocationDecision,
   StartupLocationRecommendation
@@ -3080,7 +3081,7 @@ export class App {
       const rows = sorted.map((s) => [
         s.storeNo,
         formatDistanceKm(s.distanceMeters),
-        s.storeName,
+        formatStoreDisplayName(s),
         s.waitingCups !== undefined ? String(s.waitingCups) : "-",
         s.waitingTime !== undefined ? String(s.waitingTime) : "-",
         s.runningStatusDesc ?? "-"
